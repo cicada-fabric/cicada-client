@@ -1,25 +1,20 @@
-# 给 CICADA 核心开发者的 Client v1.1 交接
+# 给 CICADA 核心开发者的 Client v1.2 交接
 
-**基线：**核心提交 `fb0f07a2330084b9402eb72878388bd1866bee10`，`client-hub-v1.1`，catalog SHA-256 `f6f05783ddc00e51b92ebe050b5d8e6b9b185fae80d8fc6f04bc3143b6782374`。Client 只修改 `~/CICADA_CLIENT`，不读取 Hub 数据库，不在手机保存 Hub/Node bearer，也不使用旧 `/v1` 管理接口。实际镜像、APK、命令和结果见 [验收记录](client-hub-v1.1-validation.md)。
+**固定基线：**Hub commit `01d51ece186a7ec53dc2a83b77e05085f939bd28`，协议包 SHA-256 `628910647ecca9cf1b6d72a2872e22f6b0158b421a92b6349331a1bfdb640151`，catalog SHA-256 `613084ee67f75d27762ddaf59ec2e5b33ebea7383cbfcf455a50b472e756c66a`，完整镜像 ID `sha256:e31b4c5dc6fceb27932fbc4e5a43afac425b6ef0647a3c7f25788ff52b31585b`。Client 只修改 `~/CICADA_CLIENT`，不读取 Hub 数据库，不在手机保存 Hub/Node bearer，也不使用旧 `/v1` 管理接口。实测与未运行项见 [v1.2 验收](client-hub-v1.2-validation.md)。
 
-## 已可对接
+## Client 已对接
 
-- Android Kotlin 验证公开的双向加密、ML-DSA 签名、AAD、篡改拒绝向量；候选 Hub 身份仍须用户独立固定。设备 Grant 在本机验签，再向真实 Hub 登记。
-- 加密 `session.capabilities` 同时校验 Owner、角色、合同修订和 catalog 摘要；UI 和原生 RPC 以 allowlist 开放 `status.snapshot/changes`、`intent.*`、`topology.*`、`nodes.*`、`approvals.*`、Owner 自己的 `devices.*` 和仅限提案的 `link.*`。实际调用仍受 Hub Guard 控制。
-- 原始加密 RPC 包和序号在网络发送前写入设备私有存储；普通断网后按原字节恢复。Hub HTTP 409 后持久冻结原包并停止新 RPC；设备登记 201 丢失时冻结原设备身份和原 Grant 摘要。两者都需要核心提供恢复协议，不能凭客户端猜测终态。
-- `external_thread_links=false` 时仅展示 Link 提案，隐藏普通跨用户 Thread 消息；`status_events=false` 时只用快照和部分 changes，不宣称实时完整事件。Group key 的 Client 签署入口关闭，直至取得完整 Endpoint proof 并独立验签。
+- Android Kotlin 独立验证公开双向密码学向量；候选 Hub 身份仍须用户独立固定，Grant 本机验签。加密 `session.capabilities` 校验 owner、角色、合同和 catalog 后才开放相关操作。
+- 登记 201 丢失后，原 Grant 请求跨重建原样重发。加密 RPC 在网络发送前持久保存原签名密文、operation ID、请求序号和预期响应序号；丢失 200 后交 `/v2/client/rpc/recover`，已完成时消费原密文。`STILL_PROCESSING` 保留 pending，`RECOVERY_UNAVAILABLE` 保留阻断，`RECOVERY_REJECTED` 只有用户明确选择才原包重试；签名 `OUTCOME_UNCERTAIN` 退休传输 pending，但保留业务不确定标记并要求权威状态对账。固定镜像的后三种恢复故障注入还未通过 Android 实测。
+- 文本与本地语音草稿经确认调用 `intent.submit/status`；manager 在授权下以 `intent_id` 查询 `goal.result`，分别显示 Intent、Goal、Worker 和有限 Artifact 引用。`approvals.list/decide` 已接入，真实远端 Codex Worker 审批闭环仍阻塞。
+- `external_thread_links=false` 时只显示连接提案，`status_events=false` 时只用快照和部分 changes。Group Key Grant 签署保持关闭。
 
-## 核心需答复和实现
+## 核心需处理
 
-请以 [接口缺口与复现](hub-interface-requests.md)为具体请求。优先顺序建议：
+1. **修正 Endpoint attestation 签名原文冲突。**固定 wire 明确签名 JSON 排除 `signature`，固定 Go 实际签入 `"signature":null`。请选定唯一原文字节，让 Hub/Node/Client 合同与实现一致；提供完整公开合成向量及新干净提交、协议包、catalog、镜像 ID。否则 Client 无法独立验证 `candidate_attestation`、binding/manifest digest，不会签 `group.key_grant`。请求和复现见 [v1.2 接口请求](hub-interface-requests-v12.md)。
+2. **提供隔离固定镜像恢复故障入口。**固定 Go Store/HTTP 测试覆盖 `STILL_PROCESSING`、重启后 `OUTCOME_UNCERTAIN`、旧请求 `RECOVERY_UNAVAILABLE`；现有运行镜像没有可让 Android 合法触发的确定性入口。请给隔离数据和完整命令，不要求 Client 读数据库或持有管理 bearer。Client 需要逐项验证原包、密文、签名、预留序号、撤权与禁止重复执行。
+3. **完成远端 Node Codex Worker 审批桥。**需要同一 Goal/Worker/attempt 的 Node 认证审批请求、Client `approvals.decide`、旧 attempt fencing、Worker 继续原任务并回报。现有人工 Node HTTP result 与合成 Approval 不能替代真实原生回调。
 
-1. **N4 设备登记响应丢失。** 提供与原 Grant、设备公钥、Hub、nonce 绑定的权威查询/恢复；区分已提交、未提交、已撤销、过期、Owner key 失效。当前重发同一登记可能得到 403，Client 无法证明 201 是否已提交。
-2. **N4 RPC 409/UNCERTAIN。** 定义设备认证的原包对账；响应需绑定 epoch、sequence、operation ID 和包摘要，区分缓存完成、仍处理、确定未执行、UNCERTAIN、撤权。明确何时可安全退休 pending，尤其是 Hub 重启后。Client 当前冻结，避免重复执行。
-3. **Group key 取证。** `group.key_manifest` 经 Client 加密 RPC 返回完整 Endpoint self-attestation 和绑定证据，或提供不要求 Node bearer 的等效公开证明。仅 digest 不足以在手机独立验签。
-4. **N5 真实闭环。** 给出隔离的真实 Node/Agent 启动和可稳定产生 Approval 的任务，使 Android Intent→Hub→真实 Worker→审批→结果可复跑。现有 Go `httptest`/人工 claim/result 仅证明协议模拟，不证明真实 Codex 执行。
+## 可直接交给核心开发 AI 的提示词
 
-请先修订 `docs/client-hub-wire-v1.md`、OpenAPI、catalog 和公开向量，再提供针对丢包、409、Hub 重启、撤权和重放的服务端测试。Client 在新合同及证明材料可独立验证后再启用恢复和 Group key。核心若修改 catalog 摘要，Client 的固定摘要和测试包必须同步升级。
-
-## 可直接发送给核心开发 AI 的提示词
-
-> 你只负责 `~/CICADA` 核心仓库。先核对当前 Git 分支、未提交修改、`CICADA.md`、`docs/client-hub-development.md`、`docs/client-hub-handoff.md`、`docs/client-hub-wire-v1.md`、OpenAPI、路由和测试。Client 基线是 `client-hub-v1.1` / `fb0f07a`，现有 Android 适配已按公开合同验证；不要直接修改 `~/CICADA_CLIENT`，也不要让手机读取数据库或持有 Hub/Node bearer。请优先设计并实现安全 N4：设备登记 201 响应丢失时的受认证恢复，以及加密 `/v2/client/rpc` HTTP 409/`UNCERTAIN` 的原包对账与安全退休；保留单调序号和至多一次效果，写出跨重启、撤权、重放、并发故障注入测试。给 Client 明确的请求/响应、认证绑定、终态和重试规则，更新 wire、OpenAPI、catalog、公开向量与协议包。然后为 Group key 的 Client manifest 提供完整可验签 Endpoint proof/绑定证据，不要求 Node bearer；提供隔离的真实 Node Worker→审批→结果测试流程。详见 `~/CICADA_CLIENT/docs/hub-interface-requests.md` 与 `docs/client-hub-v1.1-validation.md`。请逐项回报新核心提交、镜像 ID、合同摘要、测试命令/退出码与尚未解决的风险，不能把 Go mock 视作真实 Codex 或真机/公网 HTTPS 验收。
+> 你只负责 `~/CICADA`，先检查工作树和固定 `01d51ece186a7ec53dc2a83b77e05085f939bd28` 合同、Go 路由、测试；不要修改 `~/CICADA_CLIENT`。Client 已固定 v1.2 协议包 SHA-256 `628910647ecca9cf1b6d72a2872e22f6b0158b421a92b6349331a1bfdb640151`、catalog `613084ee67f75d27762ddaf59ec2e5b33ebea7383cbfcf455a50b472e756c66a` 和完整镜像 ID `sha256:e31b4c5dc6fceb27932fbc4e5a43afac425b6ef0647a3c7f25788ff52b31585b`。请先解决 `EndpointKeyAttestation` 签名原文冲突：wire 排除 `signature`，Go `json.Marshal` 实际包含 `"signature":null`；统一 Hub、Node、wire、OpenAPI 和公开完整向量，提供可独立验证的原始证明、完整公钥、ID/epoch、revision、binding 和 manifest digest。再提供隔离固定镜像可复跑的 Android 故障注入方案，分别触发 `/v2/client/rpc/recover` 的 `STILL_PROCESSING`、重启后的签名密文 `OUTCOME_UNCERTAIN` 和旧请求 `RECOVERY_UNAVAILABLE`，不让 Client 读 Hub 数据库或持有 bearer。最后完成真实远端 Node Codex Worker→审批→继续原任务→`goal.result` 桥，含 Node 认证和旧 attempt fencing；不要用人工 Approval 或合成 Node 结果代替。每项交付干净 commit、协议包/catalog SHA-256、完整镜像 ID、测试命令/退出码和脱敏证据；详见 `~/CICADA_CLIENT/docs/hub-interface-requests-v12.md` 与 `docs/client-hub-v1.2-validation.md`。
