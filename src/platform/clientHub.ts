@@ -5,6 +5,7 @@ export type ClientRpcOperation =
   | 'status.snapshot'
   | 'status.changes'
   | 'goal.lifecycle'
+  | 'goal.result'
   | 'topology.snapshot'
   | 'topology.apply'
   | 'devices.list'
@@ -24,15 +25,15 @@ export type ClientRpcOperation =
   | 'link.invite_preview'
   | 'link.invite_accept';
 
-// Advertised by v1.1, but intentionally absent from the callable Client RPC
-// union until canonical manifests and Endpoint attestations can be verified.
+// Key grant operations remain advertised separately until canonical manifests
+// and Endpoint attestations have a native verifier.
 export type ClientHubAdvertisedOperation = ClientRpcOperation |
   'link.key_manifest' | 'link.key_grants' | 'link.key_grant' |
   'group.key_manifest' | 'group.key_grant' | 'group.key_status';
 
 export interface ClientHubCapabilities {
   contract: string;
-  contract_revision: 'client-hub-v1.1';
+  contract_revision: 'client-hub-v1.2';
   catalog_sha256: string;
   status: 'partial' | 'not_ready' | string;
   planned_platform: string;
@@ -92,10 +93,42 @@ export interface ClientHubEnrollment {
   state: 'ACTIVE' | string;
 }
 
+export interface ClientGoalResultRequest {
+  intent_id: string;
+}
+
+export interface ClientGoalResultWorker {
+  worker_id: string;
+  status: string;
+  attempt: number;
+  summary?: string;
+}
+
+export interface ClientGoalArtifactReference {
+  artifact_id: string;
+  name: string;
+  kind: string;
+  digest?: string;
+  status: string;
+}
+
+export interface ClientGoalResult {
+  intent_id: string;
+  intent_status: string;
+  goal_id?: string;
+  goal_status?: string;
+  outcome?: string;
+  summary?: string;
+  workers: ClientGoalResultWorker[];
+  artifacts: ClientGoalArtifactReference[];
+  workers_truncated: boolean;
+  artifacts_truncated: boolean;
+}
+
 export interface ClientHubSessionCapabilities {
   owner_id: string;
   role: 'manager' | 'external' | string;
-  contract_revision: 'client-hub-v1.1';
+  contract_revision: 'client-hub-v1.2';
   catalog_sha256: string;
   available_rpc_operations: ClientHubAdvertisedOperation[];
 }
@@ -121,6 +154,8 @@ export interface ClientHubStatus {
   nextSequence?: number;
   pendingOperationId?: string;
   pendingOperation?: ClientRpcOperation;
+  outcomeUncertainOperationId?: string;
+  uncertainNeedsReconciliation?: boolean;
   allowedOperations: ClientRpcOperation[];
   error?: string;
 }
@@ -144,6 +179,8 @@ export interface NativeClientHubStatus {
   nextSequence?: number;
   pendingOperationId?: string;
   pendingOperation?: string;
+  outcomeUncertainOperationId?: string;
+  uncertainNeedsReconciliation?: boolean;
   allowedOperations: string[];
 }
 
@@ -167,16 +204,19 @@ export interface ClientHubNativeBridge {
     deviceId: string;
     ownerDeviceGrantBase64: string;
   }): Promise<ClientHubEnrollment>;
+  recoverEnrollment(): Promise<ClientHubEnrollment>;
   rpc(input: {
     operation: ClientRpcOperation;
     body: Record<string, unknown>;
     operationId?: string;
   }): Promise<unknown>;
   recoverPending(): Promise<unknown>;
+  retryPendingExact(): Promise<unknown>;
 }
 
 export interface ClientHubApi extends Omit<ClientHubNativeBridge, 'getStatus'> {
   getStatus(): Promise<ClientHubStatus>;
+  goalResult(input: ClientGoalResultRequest): Promise<ClientGoalResult>;
 }
 
 const native = NativeModules.CicadaClientHub as ClientHubNativeBridge | undefined;
@@ -197,7 +237,7 @@ const unavailable = async (): Promise<never> => {
 };
 
 const operationNames: ClientRpcOperation[] = [
-  'session.capabilities', 'status.snapshot', 'status.changes', 'goal.lifecycle',
+  'session.capabilities', 'status.snapshot', 'status.changes', 'goal.lifecycle', 'goal.result',
   'topology.snapshot', 'topology.apply', 'devices.list', 'devices.revoke',
   'nodes.preview', 'nodes.confirm', 'nodes.list', 'nodes.revoke', 'approvals.list',
   'approvals.decide', 'intent.get', 'intent.status', 'intent.list', 'intent.submit',
@@ -226,8 +266,17 @@ export const clientHub: ClientHubApi = Platform.OS === 'android' && native ? {
   createDeviceIdentity: () => native.createDeviceIdentity(),
   startNewDeviceEnrollment: () => native.startNewDeviceEnrollment(),
   enroll: input => native.enroll(input),
+  recoverEnrollment: () => native.recoverEnrollment(),
+  goalResult: async input => {
+    const status = normalizeStatus(await native.getStatus());
+    if (!operationAllowed(status, 'goal.result')) {
+      throw new Error('当前加密 session.capabilities 未授权 goal.result');
+    }
+    return native.rpc({operation: 'goal.result', body: {intent_id: input.intent_id}}) as Promise<ClientGoalResult>;
+  },
   rpc: input => native.rpc(input),
   recoverPending: () => native.recoverPending(),
+  retryPendingExact: () => native.retryPendingExact(),
 } : {
   getStatus: async () => unavailableStatus,
   fetchHubMetadata: () => unavailable(),
@@ -235,14 +284,22 @@ export const clientHub: ClientHubApi = Platform.OS === 'android' && native ? {
   createDeviceIdentity: () => unavailable(),
   startNewDeviceEnrollment: () => unavailable(),
   enroll: () => unavailable(),
+  recoverEnrollment: () => unavailable(),
+  goalResult: () => unavailable(),
   rpc: () => unavailable(),
   recoverPending: () => unavailable(),
+  retryPendingExact: () => unavailable(),
 };
 
 export function operationAllowed(
   status: ClientHubStatus,
   operation: ClientRpcOperation,
 ): boolean {
+  if (status.uncertainNeedsReconciliation && [
+    'goal.lifecycle', 'topology.apply', 'devices.revoke', 'nodes.confirm',
+    'nodes.revoke', 'approvals.decide', 'intent.submit', 'link.invite_create',
+    'link.invite_accept',
+  ].includes(operation)) return false;
   return status.nativeAvailable && status.remoteEnabled &&
     status.sessionCapabilitiesReady && !status.pendingOperationId &&
     status.allowedOperations.includes(operation);

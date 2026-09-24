@@ -37,6 +37,14 @@ public final class HostPacketProbe {
         return ClientWireCrypto.HubPin.parse(read(identityFile));
     }
 
+    private static void generate(String[] args) throws Exception {
+        try (ClientWireCrypto.Identity identity = ClientWireCrypto.Identity.generate()) {
+            writeNew(args[1], identity.privateJson());
+            writeNew(args[2], identity.publicIdentity.toJson());
+            System.out.println("generated public identity " + identity.publicIdentity.id);
+        }
+    }
+
     private static void seal(String[] args) throws Exception {
         // seal PRIVATE HUB_IDENTITY OWNER DEVICE SEQUENCE OPERATION_ID OPERATION BODY_FILE PACKET_FILE
         ClientWireCrypto.Identity device = device(args[1]);
@@ -73,8 +81,9 @@ public final class HostPacketProbe {
     }
 
     public static void main(String[] args) throws Exception {
-        if (args.length == 10 && args[0].equals("seal")) seal(args);
+        if (args.length == 3 && args[0].equals("generate")) generate(args);
+        else if (args.length == 10 && args[0].equals("seal")) seal(args);
         else if (args.length == 6 && args[0].equals("open")) open(args);
-        else throw new IllegalArgumentException("seal PRIVATE HUB_IDENTITY OWNER DEVICE SEQUENCE OP_ID OP BODY PACKET | open PRIVATE HUB_IDENTITY REQUEST RESPONSE RESULT");
+        else throw new IllegalArgumentException("generate PRIVATE PUBLIC | seal PRIVATE HUB_IDENTITY OWNER DEVICE SEQUENCE OP_ID OP BODY PACKET | open PRIVATE HUB_IDENTITY REQUEST RESPONSE RESULT");
     }
 }

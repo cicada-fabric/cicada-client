@@ -51,8 +51,8 @@ class ClientHubSession(context: Context) {
     companion object {
         private const val KEY_ALIAS = "ai.cicada.client.hub.device-wrap.v1"
         private val KEY_AAD = "cicada/android/client-device-key/wrap/v1\u0000".toByteArray(StandardCharsets.UTF_8)
-        private const val CONTRACT_REVISION = "client-hub-v1.1"
-        private const val CATALOG_SHA256 = "f6f05783ddc00e51b92ebe050b5d8e6b9b185fae80d8fc6f04bc3143b6782374"
+        private const val CONTRACT_REVISION = "client-hub-v1.2"
+        private const val CATALOG_SHA256 = "613084ee67f75d27762ddaf59ec2e5b33ebea7383cbfcf455a50b472e756c66a"
         private const val MAX_BODY_BYTES = 64 * 1024
         private const val MAX_PACKET_BYTES = 256 * 1024
         private const val MAX_RESPONSE_BYTES = 256 * 1024
@@ -64,8 +64,13 @@ class ClientHubSession(context: Context) {
             "session.capabilities", "status.snapshot", "status.changes", "goal.lifecycle",
             "topology.snapshot", "topology.apply", "devices.list", "devices.revoke",
             "nodes.preview", "nodes.confirm", "nodes.list", "nodes.revoke",
-            "approvals.list", "approvals.decide", "intent.get", "intent.status",
+            "approvals.list", "approvals.decide", "goal.result", "intent.get", "intent.status",
             "intent.list", "intent.submit", "link.list", "link.invite_create", "link.invite_preview",
+            "link.invite_accept",
+        )
+        private val MUTATING_RPC_OPERATIONS = setOf(
+            "goal.lifecycle", "topology.apply", "devices.revoke", "nodes.confirm",
+            "nodes.revoke", "approvals.decide", "intent.submit", "link.invite_create",
             "link.invite_accept",
         )
     }
@@ -89,6 +94,8 @@ class ClientHubSession(context: Context) {
         val operation: String,
         val operationId: String,
         val sequence: Long,
+        /** Reserved expected Hub sequence, calculated before transmission. */
+        val expectedResponseSequence: Long?,
         /** Exact serialized signed and encrypted packet; retries must send these same bytes. */
         val packetJson: String,
     )
@@ -98,6 +105,8 @@ class ClientHubSession(context: Context) {
         val deviceId: String,
         val deviceKeyId: String,
         val grantSha256: String,
+        /** Exact enrollment POST body, retained across a lost HTTP 201 response. */
+        val requestJson: String?,
     )
 
     private data class State(
@@ -117,6 +126,8 @@ class ClientHubSession(context: Context) {
         var retiredPending: Pending? = null,
         var pending: Pending? = null,
         var enrollmentAttempt: EnrollmentAttempt? = null,
+        var outcomeUncertainOperationId: String? = null,
+        var uncertainNeedsReconciliation: Boolean = false,
     )
 
     /** Fetches public metadata only. This method never establishes or changes trust. */
@@ -186,6 +197,8 @@ class ClientHubSession(context: Context) {
             state.authFenced = false
             state.recoveryBlocked = false
             state.sessionError = null
+            state.outcomeUncertainOperationId = null
+            state.uncertainNeedsReconciliation = false
             state.pending = null
         }
         state.pin = Pin(base, normalizedHubId, canonicalIdentity)
@@ -243,6 +256,8 @@ class ClientHubSession(context: Context) {
         state.authFenced = false
         state.recoveryBlocked = false
         state.sessionError = null
+        state.outcomeUncertainOperationId = null
+        state.uncertainNeedsReconciliation = false
         state.pending = null
         writeState(state)
         deleteDeviceWrappingKey()
@@ -313,40 +328,79 @@ class ClientHubSession(context: Context) {
             }
             val grantDigest = MessageDigest.getInstance("SHA-256").digest(grantBytes)
                 .joinToString("") { byte -> "%02x".format(byte.toInt() and 0xff) }
-            state.enrollmentAttempt = EnrollmentAttempt(checkedOwner, checkedDeviceId, deviceIdentity.publicIdentity.id, grantDigest)
+            val requestJson = input.toString()
+            state.enrollmentAttempt = EnrollmentAttempt(
+                checkedOwner, checkedDeviceId, deviceIdentity.publicIdentity.id, grantDigest, requestJson,
+            )
             writeState(state) // An ambiguous POST must not be recreated with a new nonce or device key.
-            val response = httpJson(pin.baseUrl, "/v2/client/devices/enroll", "POST", input.toString(), 48 * 1024, expectedStatus = 201)
-            val returnedOwner = requiredString(response, "owner_id")
-            val returnedDevice = requiredString(response, "device_id")
-            val epoch = longValue(response, "session_epoch")
-            val keyVersion = longValue(response, "device_key_version")
-            val deviceState = requiredString(response, "state")
-            if (returnedOwner != checkedOwner || returnedDevice != checkedDeviceId || epoch < 1 || keyVersion < 1 || deviceState != "ACTIVE") {
-                throw HubSessionException("INVALID_ENROLLMENT_RESPONSE", "Hub returned an enrollment that does not match this request")
-            }
-            state.enrollment = Enrollment(returnedOwner, returnedDevice, epoch, keyVersion, deviceState)
-            state.nextSequence = 1
-            state.lastResponseSequence = 0
-            state.role = null
-            state.sessionCapabilitiesReady = false
-            state.validatedContractRevision = null
-            state.validatedCatalogSha256 = null
-            state.allowedOperations = emptyList()
-            state.authFenced = false
-            state.recoveryBlocked = false
-            state.sessionError = null
-            state.pending = null
-            state.enrollmentAttempt = null
-            writeState(state)
-            JsonObject().apply {
-                addProperty("ownerId", returnedOwner)
-                addProperty("deviceId", returnedDevice)
-                addProperty("sessionEpoch", epoch)
-                addProperty("deviceKeyVersion", keyVersion)
-                addProperty("state", deviceState)
-            }
+            val response = httpJson(pin.baseUrl, "/v2/client/devices/enroll", "POST", requestJson, 48 * 1024, expectedStatus = 201)
+            finishEnrollment(state, response, state.enrollmentAttempt!!)
         } finally {
             deviceIdentity.close()
+        }
+    }
+
+    /** Resends the exact persisted enrollment bytes, even when the original Grant has expired. */
+    fun recoverEnrollment(): JsonObject = PROCESS_LOCK.withLock {
+        val state = readState()
+        if (state.enrollment != null) throw HubSessionException("ALREADY_ENROLLED", "Device enrollment already completed")
+        val attempt = state.enrollmentAttempt
+            ?: throw HubSessionException("NO_PENDING_ENROLLMENT", "There is no device enrollment to recover")
+        val exactRequest = attempt.requestJson
+            ?: throw HubSessionException("ENROLLMENT_RECOVERY_UNAVAILABLE", "Older enrollment attempt has no preserved request bytes")
+        val pin = state.pin ?: throw HubSessionException("HUB_NOT_PINNED", "Hub pin is missing")
+        val device = loadDeviceIdentity()
+        try {
+            if (device.publicIdentity.id != attempt.deviceKeyId) {
+                throw HubSessionException("DEVICE_KEY_MISMATCH", "Persisted enrollment uses a different device identity")
+            }
+            verifyLivePinnedIdentity(pin)
+            val original = parseObject(exactRequest, "Persisted enrollment is invalid")
+            val originalGrant = decodeCanonicalBase64(requiredString(original, "owner_device_grant"))
+            val digest = MessageDigest.getInstance("SHA-256").digest(originalGrant)
+                .joinToString("") { byte -> "%02x".format(byte.toInt() and 0xff) }
+            if (digest != attempt.grantSha256 ||
+                requiredString(original, "owner_id") != attempt.ownerId ||
+                requiredString(original, "device_id") != attempt.deviceId ||
+                requiredString(original.getAsJsonObject("device_public_identity"), "id") != attempt.deviceKeyId) {
+                throw HubSessionException("ENROLLMENT_RECOVERY_INVALID", "Persisted enrollment identity or Grant changed")
+            }
+            val response = httpJson(pin.baseUrl, "/v2/client/devices/enroll", "POST", exactRequest, 48 * 1024, expectedStatus = 201)
+            finishEnrollment(state, response, attempt)
+        } finally {
+            device.close()
+        }
+    }
+
+    private fun finishEnrollment(state: State, response: JsonObject, attempt: EnrollmentAttempt): JsonObject {
+        val owner = requiredString(response, "owner_id")
+        val device = requiredString(response, "device_id")
+        val epoch = longValue(response, "session_epoch")
+        val keyVersion = longValue(response, "device_key_version")
+        val deviceState = requiredString(response, "state")
+        if (owner != attempt.ownerId || device != attempt.deviceId || epoch < 1 || keyVersion < 1 || deviceState != "ACTIVE") {
+            throw HubSessionException("INVALID_ENROLLMENT_RESPONSE", "Hub returned an enrollment that does not match this request")
+        }
+        state.enrollment = Enrollment(owner, device, epoch, keyVersion, deviceState)
+        state.nextSequence = 1
+        state.lastResponseSequence = 0
+        state.role = null
+        state.sessionCapabilitiesReady = false
+        state.validatedContractRevision = null
+        state.validatedCatalogSha256 = null
+        state.allowedOperations = emptyList()
+        state.authFenced = false
+        state.recoveryBlocked = false
+        state.sessionError = null
+        state.pending = null
+        state.enrollmentAttempt = null
+        writeState(state)
+        return JsonObject().apply {
+            addProperty("ownerId", owner)
+            addProperty("deviceId", device)
+            addProperty("sessionEpoch", epoch)
+            addProperty("deviceKeyVersion", keyVersion)
+            addProperty("state", deviceState)
         }
     }
 
@@ -361,22 +415,86 @@ class ClientHubSession(context: Context) {
         createAndSend(state, operation, body, operationId)
     }
 
-    /** Re-sends the persisted packet byte-for-byte after a transport interruption. */
+    /** Asks Hub to recover the exact persisted packet without dispatching the operation again. */
     fun recoverPending(): JsonObject = PROCESS_LOCK.withLock {
         val state = readState()
         requireReadyForRpc(state)
         val pending = state.pending ?: throw HubSessionException("NO_PENDING_REQUEST", "There is no encrypted request to recover")
-        if (state.recoveryBlocked) {
-            throw HubSessionException("RECOVERY_PROTOCOL_REQUIRED", "Hub returned HTTP 409; keep the original ciphertext and sequence until the Hub defines safe reconciliation")
+        if (pending.expectedResponseSequence == null) {
+            throw HubSessionException("RECOVERY_SEQUENCE_UNAVAILABLE", "Older pending request has no persisted expected response sequence")
         }
         val pin = state.pin ?: throw HubSessionException("HUB_NOT_PINNED", "Hub pin is missing")
-        val enrollment = state.enrollment ?: throw HubSessionException("DEVICE_NOT_ENROLLED", "Device enrollment is missing")
         val device = loadDeviceIdentity()
         try {
             val control = loadControlIdentity(pin)
             val route = routeFromPacket(pending.packetJson)
-            val packetResponse = sendRpcPacket(state, pin.baseUrl, pending.packetJson)
+            if (route.operationId != pending.operationId || route.sequence != pending.sequence ||
+                route.operation != pending.operation) {
+                throw HubSessionException("PENDING_PACKET_INVALID", "Persisted request metadata differs from its signed route")
+            }
+            val packetResponse = try {
+                httpJsonRaw(pin.baseUrl, "/v2/client/rpc/recover", pending.packetJson, MAX_RESPONSE_BYTES)
+            } catch (error: HubSessionException) {
+                when (error.errorCode) {
+                    "HTTP_409_STILL_PROCESSING" -> {
+                        state.sessionError = "STILL_PROCESSING"
+                        writeState(state)
+                        throw HubSessionException("STILL_PROCESSING", "Original encrypted request is still processing")
+                    }
+                    "HTTP_409_RECOVERY_UNAVAILABLE" -> {
+                        state.recoveryBlocked = true
+                        state.sessionError = "RECOVERY_UNAVAILABLE"
+                        writeState(state)
+                        throw HubSessionException("RECOVERY_UNAVAILABLE", "Older uncertain request cannot be safely recovered")
+                    }
+                    "HTTP_409_RECOVERY_REJECTED" -> {
+                        state.sessionError = "RECOVERY_REJECTED"
+                        writeState(state)
+                    }
+                    "HTTP_403" -> {
+                        state.authFenced = true
+                        state.sessionCapabilitiesReady = false
+                        state.allowedOperations = emptyList()
+                        state.role = null
+                        state.sessionError = "RPC_HTTP_403"
+                        writeState(state)
+                    }
+                    "HTTP_409" -> {
+                        state.recoveryBlocked = true
+                        state.sessionError = "RPC_RECOVERY_CONFLICT"
+                        writeState(state)
+                    }
+                }
+                throw error
+            }
             finishResponse(state, device, control, route, packetResponse)
+        } finally {
+            device.close()
+        }
+    }
+
+    /** Explicit exact retry for a request that may never have reached Hub. */
+    fun retryPendingExact(): JsonObject = PROCESS_LOCK.withLock {
+        val state = readState()
+        requireReadyForRpc(state)
+        val pending = state.pending
+            ?: throw HubSessionException("NO_PENDING_REQUEST", "There is no encrypted request to retry")
+        if (state.sessionError != "RECOVERY_REJECTED") {
+            throw HubSessionException("EXACT_RETRY_NOT_READY", "First ask Hub to recover the original request")
+        }
+        if (pending.expectedResponseSequence == null) {
+            throw HubSessionException("RECOVERY_SEQUENCE_UNAVAILABLE", "Older pending request has no persisted response sequence")
+        }
+        val pin = state.pin ?: throw HubSessionException("HUB_NOT_PINNED", "Hub pin is missing")
+        val device = loadDeviceIdentity()
+        try {
+            val route = routeFromPacket(pending.packetJson)
+            if (route.operationId != pending.operationId || route.sequence != pending.sequence ||
+                route.operation != pending.operation) {
+                throw HubSessionException("PENDING_PACKET_INVALID", "Persisted request metadata differs from its signed route")
+            }
+            val response = sendRpcPacket(state, pin.baseUrl, pending.packetJson)
+            finishResponse(state, device, loadControlIdentity(pin), route, response)
         } finally {
             device.close()
         }
@@ -397,6 +515,8 @@ class ClientHubSession(context: Context) {
             addProperty("previousDeviceMayRemainOnHub", state.previousDeviceMayRemainOnHub)
             addProperty("hasRetiredPending", state.retiredPending != null)
             addProperty("enrollmentRecoveryRequired", state.enrollmentAttempt != null)
+            state.outcomeUncertainOperationId?.let { addProperty("outcomeUncertainOperationId", it) }
+            addProperty("uncertainNeedsReconciliation", state.uncertainNeedsReconciliation)
             state.enrollmentAttempt?.let { attempt ->
                 addProperty("pendingEnrollmentOwnerId", attempt.ownerId)
                 addProperty("pendingEnrollmentDeviceId", attempt.deviceId)
@@ -428,7 +548,9 @@ class ClientHubSession(context: Context) {
         try {
             val control = loadControlIdentity(pin)
             val sequence = state.nextSequence
-            if (sequence < 1 || sequence == Long.MAX_VALUE) throw HubSessionException("SEQUENCE_EXHAUSTED", "Encrypted request sequence is exhausted")
+            if (sequence < 1 || sequence == Long.MAX_VALUE || state.lastResponseSequence == Long.MAX_VALUE) {
+                throw HubSessionException("SEQUENCE_EXHAUSTED", "Encrypted request sequence is exhausted")
+            }
             val logicalId = operationId?.trim()?.takeIf { it.isNotEmpty() } ?: UUID.randomUUID().toString()
             if (logicalId.length > 256) throw HubSessionException("INVALID_OPERATION_ID", "Operation ID is too long")
             val route = ClientWireCrypto.Route().apply {
@@ -459,7 +581,7 @@ class ClientHubSession(context: Context) {
                 throw HubSessionException("REQUEST_TOO_LARGE", "Encrypted RPC packet exceeds the protocol limit")
             }
             state.nextSequence = sequence + 1
-            state.pending = Pending(operation, logicalId, sequence, exactPacket)
+            state.pending = Pending(operation, logicalId, sequence, state.lastResponseSequence + 1, exactPacket)
             writeState(state) // Sequence and original ciphertext reach durable storage before network I/O.
             val response = sendRpcPacket(state, pin.baseUrl, exactPacket)
             return finishResponse(state, device, control, route, response)
@@ -481,15 +603,31 @@ class ClientHubSession(context: Context) {
             // Keep the original packet for exact retry if response authentication fails.
             throw HubSessionException("INVALID_ENCRYPTED_RESPONSE", "Hub response failed post-quantum authentication or decryption")
         }
-        if (opened.route.sequence != state.lastResponseSequence + 1) {
+        val pending = state.pending
+            ?: throw HubSessionException("PENDING_PACKET_INVALID", "Encrypted response has no original pending request")
+        if (pending.operationId != route.operationId || pending.sequence != route.sequence ||
+            pending.expectedResponseSequence == null ||
+            opened.route.sequence != pending.expectedResponseSequence ||
+            opened.route.sequence != state.lastResponseSequence + 1) {
             throw HubSessionException("RESPONSE_SEQUENCE_CONFLICT", "Hub response sequence is not monotonic")
         }
         val body = opened.body
-        val requestId = optionalString(body, "request_id") ?: ""
+        val requestId = optionalString(body, "request_id")?.takeIf { it.isNotBlank() }
+            ?: throw HubSessionException("INVALID_ENCRYPTED_RESPONSE", "Decrypted Hub response omitted request ID")
         val operationId = optionalString(body, "operation_id") ?: ""
         val ok = body.get("ok")?.takeIf { it.isJsonPrimitive && it.asJsonPrimitive.isBoolean }?.asBoolean
             ?: throw HubSessionException("INVALID_ENCRYPTED_RESPONSE", "Decrypted Hub response is missing its result status")
         if (operationId != route.operationId) throw HubSessionException("INVALID_ENCRYPTED_RESPONSE", "Decrypted operation ID does not match the request")
+
+        val uncertain = optionalString(body, "error_code") == "OUTCOME_UNCERTAIN"
+        if (uncertain) {
+            val recovery = body.get("recovery")?.takeIf { it.isJsonObject }?.asJsonObject
+                ?: throw HubSessionException("INVALID_ENCRYPTED_RESPONSE", "Uncertain response omitted recovery context")
+            if (ok || optionalString(recovery, "state") != "UNCERTAIN" ||
+                longValue(recovery, "request_sequence") != pending.sequence) {
+                throw HubSessionException("INVALID_ENCRYPTED_RESPONSE", "Uncertain response does not match original request")
+            }
+        }
 
         if (route.operation == "session.capabilities" && ok) {
             val result = body.get("result")?.takeIf { it.isJsonObject }?.asJsonObject
@@ -538,7 +676,14 @@ class ClientHubSession(context: Context) {
         state.lastResponseSequence = opened.route.sequence
         state.pending = null
         state.recoveryBlocked = false
-        state.sessionError = null
+        state.sessionError = if (uncertain) "OUTCOME_UNCERTAIN" else null
+        if (uncertain) {
+            state.outcomeUncertainOperationId = pending.operationId
+            state.uncertainNeedsReconciliation = true
+            state.retiredPending = pending
+        } else if (route.operation == "status.snapshot" && ok) {
+            state.uncertainNeedsReconciliation = false
+        }
         writeState(state)
         return JsonObject().apply {
             addProperty("requestId", requestId)
@@ -546,6 +691,10 @@ class ClientHubSession(context: Context) {
             addProperty("ok", ok)
             if (ok && body.has("result")) add("result", body.get("result"))
             if (!ok && body.has("error")) add("error", body.get("error"))
+            if (uncertain) {
+                addProperty("errorCode", "OUTCOME_UNCERTAIN")
+                add("recovery", body.get("recovery"))
+            }
         }
     }
 
@@ -558,6 +707,9 @@ class ClientHubSession(context: Context) {
 
     private fun validateOperation(state: State, operation: String) {
         if (operation !in RPC_OPERATIONS) throw HubSessionException("UNSUPPORTED_RPC_OPERATION", "Operation is not in the Client RPC contract")
+        if (state.uncertainNeedsReconciliation && operation in MUTATING_RPC_OPERATIONS) {
+            throw HubSessionException("BUSINESS_RECONCILIATION_REQUIRED", "Read an authenticated Hub status snapshot before another write")
+        }
         if (!state.sessionCapabilitiesReady) {
             if (operation != "session.capabilities") {
                 throw HubSessionException("SESSION_CAPABILITIES_REQUIRED", "First encrypted RPC must be session.capabilities")
@@ -755,6 +907,7 @@ class ClientHubSession(context: Context) {
                 requiredString(value, "operation"),
                 requiredString(value, "operationId"),
                 longValue(value, "sequence"),
+                optionalLong(value, "expectedResponseSequence"),
                 requiredString(value, "packetJson"),
             )
         }
@@ -766,6 +919,7 @@ class ClientHubSession(context: Context) {
                 requiredString(value, "operation"),
                 requiredString(value, "operationId"),
                 longValue(value, "sequence"),
+                optionalLong(value, "expectedResponseSequence"),
                 requiredString(value, "packetJson"),
             )
         }
@@ -775,8 +929,13 @@ class ClientHubSession(context: Context) {
                 requiredString(value, "deviceId"),
                 requiredString(value, "deviceKeyId"),
                 requiredString(value, "grantSha256"),
+                optionalString(value, "requestJson"),
             )
         }
+        state.outcomeUncertainOperationId = optionalString(json, "outcomeUncertainOperationId")
+        state.uncertainNeedsReconciliation = json.get("uncertainNeedsReconciliation")
+            ?.takeIf { it.isJsonPrimitive && it.asJsonPrimitive.isBoolean }?.asBoolean
+            ?: (state.outcomeUncertainOperationId != null)
         if (state.validatedContractRevision != CONTRACT_REVISION || state.validatedCatalogSha256 != CATALOG_SHA256) {
             // An app update must not reuse an authorization from an older catalog.
             state.sessionCapabilitiesReady = false
@@ -818,11 +977,14 @@ class ClientHubSession(context: Context) {
         json.addProperty("recoveryBlocked", state.recoveryBlocked)
         json.addProperty("sessionError", state.sessionError)
         json.addProperty("previousDeviceMayRemainOnHub", state.previousDeviceMayRemainOnHub)
+        json.addProperty("outcomeUncertainOperationId", state.outcomeUncertainOperationId)
+        json.addProperty("uncertainNeedsReconciliation", state.uncertainNeedsReconciliation)
         state.retiredPending?.let { pending ->
             json.add("retiredPending", JsonObject().apply {
                 addProperty("operation", pending.operation)
                 addProperty("operationId", pending.operationId)
                 addProperty("sequence", pending.sequence)
+                pending.expectedResponseSequence?.let { addProperty("expectedResponseSequence", it) }
                 addProperty("packetJson", pending.packetJson)
             })
         }
@@ -832,6 +994,7 @@ class ClientHubSession(context: Context) {
                 addProperty("operation", pending.operation)
                 addProperty("operationId", pending.operationId)
                 addProperty("sequence", pending.sequence)
+                pending.expectedResponseSequence?.let { addProperty("expectedResponseSequence", it) }
                 addProperty("packetJson", pending.packetJson)
             })
         }
@@ -841,6 +1004,7 @@ class ClientHubSession(context: Context) {
                 addProperty("deviceId", attempt.deviceId)
                 addProperty("deviceKeyId", attempt.deviceKeyId)
                 addProperty("grantSha256", attempt.grantSha256)
+                attempt.requestJson?.let { addProperty("requestJson", it) }
             })
         }
         val output = stateFile.startWrite()
@@ -867,8 +1031,8 @@ class ClientHubSession(context: Context) {
         if (scheme == "https") {
             if (uri.port != -1 && uri.port !in 1..65535) throw HubSessionException("INVALID_HUB_URL", "Hub HTTPS port is invalid")
         } else if (scheme == "http") {
-            if (!BuildConfig.DEBUG || host != "10.0.2.2" || uri.port !in setOf(8787, 8788)) {
-                throw HubSessionException("INSECURE_HUB_URL", "HTTP is allowed only from a debug build to 10.0.2.2:8787 or :8788")
+            if (!BuildConfig.DEBUG || host != "10.0.2.2" || uri.port !in setOf(8787, 8788, 8789, 8790, 8792)) {
+                throw HubSessionException("INSECURE_HUB_URL", "HTTP is allowed only from a debug build to the local emulator Hub ports")
             }
         } else {
             throw HubSessionException("INSECURE_HUB_URL", "Hub URL must use HTTPS")
@@ -923,6 +1087,17 @@ class ClientHubSession(context: Context) {
             }
             val status = connection.responseCode
             if (status != expectedStatus) {
+                if (status == 409 && path == "/v2/client/rpc/recover") {
+                    val code = try {
+                        connection.errorStream?.use { errorStream ->
+                            optionalString(parseObject(String(readBounded(errorStream, 2048), StandardCharsets.UTF_8),
+                                "Invalid recovery conflict"), "code")
+                        }
+                    } catch (_: Exception) { null }
+                    if (code in setOf("STILL_PROCESSING", "RECOVERY_UNAVAILABLE", "RECOVERY_REJECTED")) {
+                        throw HubSessionException("HTTP_409_$code", "Hub recovery returned $code")
+                    }
+                }
                 throw HubSessionException("HTTP_$status", "Hub request failed with HTTP $status")
             }
             val stream = connection.inputStream

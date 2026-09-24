@@ -8,6 +8,7 @@ import {speechDevice} from './src/platform/speech';
 import type {SpeechModel} from './src/platform/speech';
 import {clientHub, operationAllowed} from './src/platform/clientHub';
 import type {
+  ClientGoalArtifactReference, ClientGoalResult, ClientGoalResultWorker,
   ClientHubCandidate, ClientHubCapabilities, ClientHubSessionCapabilities,
   ClientHubStatus, ClientRpcOperation,
 } from './src/platform/clientHub';
@@ -40,6 +41,7 @@ type StatusChangesPage = {completeness?: string; events?: StatusChange[];
 type NodePreview = JsonObject;
 type HubIntentStatus = JsonObject;
 type IntentOperation = Extract<ClientRpcOperation, 'intent.get' | 'intent.list' | 'intent.status' | 'intent.submit'>;
+type GoalResult = ClientGoalResult;
 const tabs: {id: Tab; name: string}[] = [
   {id: 'today', name: '概览'}, {id: 'nodes', name: '节点'},
   {id: 'work', name: '工作'}, {id: 'panel', name: '管理'},
@@ -55,6 +57,18 @@ const safeHubError = (error: unknown) => {
   if (error instanceof ClientHubRpcError) return error.message;
   const code = typeof error === 'object' && error !== null && 'code' in error ?
     String((error as {code?: unknown}).code || '') : '';
+  if (/STILL_PROCESSING/i.test(code)) {
+    return 'Hub 仍在处理原始请求；原签名密文已保留。稍后可再次调用安全恢复，新业务操作继续关闭。';
+  }
+  if (/RECOVERY_UNAVAILABLE/i.test(code)) {
+    return 'Hub 无法恢复这条旧请求；原始密文与计数仍保留。不要重发新操作，请由 Hub 管理员对账。';
+  }
+  if (/RECOVERY_REJECTED/i.test(code)) {
+    return 'Hub 确认恢复端没有这条请求的记录。原包可由你显式选择重发；若请求从未到达 Hub，重发会执行原操作。';
+  }
+  if (/OUTCOME_UNCERTAIN/i.test(code)) {
+    return 'Hub 已验证原请求结果不确定。业务结果保持待核实；未创建重试操作。';
+  }
   if (/409|UNCERTAIN|PENDING/i.test(code)) {
     return 'Hub 请求结果尚未确定。不会重发新写入；先恢复原始密文请求并重新读取权威状态。';
   }
@@ -78,8 +92,50 @@ const intentStatusLabel = (status: string) => ({
   failed: 'Intent 失败', needs_input: '需要补充输入',
 }[status] || status || '状态未知');
 const intentJobStatusLabel = (status: string) => ({
-  QUEUED: '排队中', RUNNING: '分发中', DONE: '分发完成', UNCERTAIN: '结果待核实',
+  QUEUED: '排队中', RUNNING: '执行中', DONE: 'Intent 流程结束 · 业务结果待核验',
+  UNCERTAIN: '结果待核实', FAILED: '执行失败',
 }[status] || status || '尚未读取分发状态');
+const boundedText = (value: unknown, limit: number) =>
+  typeof value === 'string' ? value.slice(0, limit) : undefined;
+const parseGoalResult = (value: unknown): GoalResult => {
+  const result = asObject(value);
+  const workers = Array.isArray(result.workers) ? result.workers.slice(0, 8) : [];
+  const artifacts = Array.isArray(result.artifacts) ? result.artifacts.slice(0, 16) : [];
+  const cleanWorkers: ClientGoalResultWorker[] = workers.map(entry => {
+    const worker = asObject(entry);
+    return {
+      worker_id: boundedText(worker.worker_id, 128) || '未知 Worker',
+      status: boundedText(worker.status, 64) || 'UNKNOWN',
+      attempt: Number.isSafeInteger(worker.attempt) && Number(worker.attempt) >= 0 ?
+        Number(worker.attempt) : 0,
+      summary: boundedText(worker.summary, 1024),
+    };
+  });
+  const cleanArtifacts: ClientGoalArtifactReference[] = artifacts.map(entry => {
+    const artifact = asObject(entry);
+    return {
+      artifact_id: boundedText(artifact.artifact_id, 128) || '未知引用',
+      name: boundedText(artifact.name, 128) || '未命名 Artifact',
+      kind: boundedText(artifact.kind, 64) || '未知类型',
+      digest: boundedText(artifact.digest, 128),
+      status: boundedText(artifact.status, 64) || 'UNKNOWN',
+    };
+  });
+  return {
+    intent_id: boundedText(result.intent_id, 128) || '',
+    intent_status: boundedText(result.intent_status, 64) || 'UNKNOWN',
+    goal_id: boundedText(result.goal_id, 128),
+    goal_status: boundedText(result.goal_status, 64),
+    outcome: boundedText(result.outcome, 256),
+    summary: boundedText(result.summary, 2048),
+    workers: cleanWorkers,
+    artifacts: cleanArtifacts,
+    workers_truncated: result.workers_truncated === true ||
+      (Array.isArray(result.workers) && result.workers.length > 8),
+    artifacts_truncated: result.artifacts_truncated === true ||
+      (Array.isArray(result.artifacts) && result.artifacts.length > 16),
+  };
+};
 const observationLabel = (value: unknown) => {
   const item = observation(value);
   if (!item.known || !item.state || item.state === 'unknown') return '未知';
@@ -190,6 +246,7 @@ function Client(): React.JSX.Element {
   const [intentHistoryBusy, setIntentHistoryBusy] = useState(false);
   const [intentHistoryMessage, setIntentHistoryMessage] = useState('');
   const [intentProgress, setIntentProgress] = useState<Record<string, HubIntentStatus>>({});
+  const [goalResults, setGoalResults] = useState<Record<string, GoalResult>>({});
   const [expandedIntentId, setExpandedIntentId] = useState('');
   const intentHistoryGeneration = useRef(0);
   const [groupName, setGroupName] = useState('');
@@ -292,6 +349,7 @@ function Client(): React.JSX.Element {
     setIntentHistoryBusy(false);
     setIntentHistoryMessage('');
     setIntentProgress({});
+    setGoalResults({});
     setExpandedIntentId('');
   };
   const clearClientDeviceMemory = () => {
@@ -305,6 +363,13 @@ function Client(): React.JSX.Element {
     capabilities = hubCapabilities, session = sessionCapabilities, status = hubStatus) =>
     Boolean(capsAllows(capabilities, 'control_intents', operation, status) &&
       session?.available_rpc_operations.includes(operation));
+  const goalResultAvailable = (capabilities = hubCapabilities,
+    session = sessionCapabilities, status = hubStatus) => Boolean(
+    session?.role === 'manager' && session.contract_revision === 'client-hub-v1.2' &&
+    capabilities?.contract_revision === 'client-hub-v1.2' &&
+    session.catalog_sha256 === capabilities.catalog_sha256 &&
+    capsAllows(capabilities, 'control_intents', 'goal.result', status) &&
+    session.available_rpc_operations.includes('goal.result'));
   const intentRpc = async (operation: IntentOperation, body: Record<string, unknown>,
     capabilities = hubCapabilities, session = sessionCapabilities) => {
     const current = await clientHub.getStatus();
@@ -331,9 +396,29 @@ function Client(): React.JSX.Element {
     rememberIntent(intent);
     setIntentProgress(previous => ({...previous, [id]: progress}));
   };
-  const refreshIntentStatus = async (intentId: string) => {
-    const value = await intentRpc('intent.status', {intent_id: intentId});
+  const refreshGoalResult = async (intentId: string,
+    capabilities = hubCapabilities, session = sessionCapabilities) => {
+    const current = await clientHub.getStatus();
+    setHubStatus(current);
+    if (!goalResultAvailable(capabilities, session, current)) return undefined;
+    const value = await clientHub.goalResult({intent_id: intentId});
+    const parsed = parseGoalResult(value);
+    if (parsed.intent_id !== intentId) throw new Error('goal.result 返回了不同的 intent_id');
+    setGoalResults(previous => ({...previous, [intentId]: parsed}));
+    return parsed;
+  };
+  const refreshIntentStatus = async (intentId: string,
+    capabilities = hubCapabilities, session = sessionCapabilities) => {
+    const value = await intentRpc('intent.status', {intent_id: intentId}, capabilities, session);
     rememberIntentProgress(value);
+    const goalResult = await refreshGoalResult(intentId, capabilities, session);
+    if (!goalResult) {
+      setGoalResults(previous => {
+        const next = {...previous};
+        delete next[intentId];
+        return next;
+      });
+    }
     return asObject(value);
   };
   const fetchIntentHistory = async () => {
@@ -347,6 +432,7 @@ function Client(): React.JSX.Element {
       const items = value.map(asObject).slice(0, 200);
       setIntentHistory(items);
       setIntentProgress({});
+      setGoalResults({});
       setExpandedIntentId('');
       setIntentHistoryVisibleCount(8);
       setIntentHistoryMessage(items.length === 0 ? 'Hub 中暂无本人 Intent 记录。' :
@@ -360,8 +446,17 @@ function Client(): React.JSX.Element {
     }
   };
   const reconcileVerifiedRecoveryRejection = async (response: JsonObject,
-    suppliedCapabilities = hubCapabilities) => {
+    suppliedCapabilities = hubCapabilities, pendingOperation?: string) => {
     const reason = field(response, 'error') || 'Hub 拒绝了此加密请求';
+    const errorCode = field(response, 'errorCode') || field(response, 'error_code');
+    const recovery = asObject(response.recovery);
+    const outcomeUncertain = errorCode === 'OUTCOME_UNCERTAIN' &&
+      field(recovery, 'state') === 'UNCERTAIN';
+    if (outcomeUncertain && pendingOperation === 'intent.submit') {
+      setTab('work');
+      setExpandedIntentId('');
+      setIntentHistoryMessage('此 intent.submit 的业务结果仍待核实。Hub 没有返回可验证 intent_id；不会猜测对应记录或重发请求。');
+    }
     let reconciliation = '';
     try {
       const current = await refreshHubStatus();
@@ -378,16 +473,65 @@ function Client(): React.JSX.Element {
       const session = asObject(await rpc('session.capabilities', {})) as
         unknown as ClientHubSessionCapabilities;
       setSessionCapabilities(session);
-      await refreshHubStatus();
+      const refreshed = await refreshHubStatus();
       const snapshot = capabilities ? await refreshRemoteData(capabilities) : undefined;
       reconciliation = snapshot ?
         '已重读 session.capabilities 和 Hub 权威状态快照。' :
         '已重读 session.capabilities；当前公开能力或会话授权未提供 status.snapshot，未取得新快照。';
+      if (outcomeUncertain && pendingOperation === 'intent.submit' &&
+          session.role === 'manager' && session.available_rpc_operations.includes('intent.list') &&
+          capsAllows(capabilities || null, 'control_intents', 'intent.list', refreshed)) {
+        const intents = await intentRpc('intent.list', {}, capabilities, session);
+        if (Array.isArray(intents)) {
+          setIntentHistory(intents.map(asObject).slice(0, 200));
+          setIntentProgress({});
+          setIntentHistoryVisibleCount(8);
+          setIntentHistoryMessage('原始 intent.submit 返回 OUTCOME_UNCERTAIN；已重读 Hub Intent 历史。无法从不确定响应推断 intent_id，因此未查询 goal.result，也未重发请求。');
+        }
+      }
     } catch (error) {
       reconciliation = '已尝试重读 session.capabilities 和权威快照，但对账未完整：' +
         safeHubError(error);
     }
-    setHubMessage(`Hub 已验证并拒绝原始加密请求：${reason}。${reconciliation}`);
+    setHubMessage(outcomeUncertain ?
+      `Hub 已验证 OUTCOME_UNCERTAIN：此业务操作保持待核实，没有创建新的 operation。${reconciliation}` :
+      `Hub 已验证并拒绝原始加密请求：${reason}。${reconciliation}`);
+  };
+  const acceptRecoveredResponse = async (current: ClientHubStatus, response: JsonObject,
+    source: 'recover' | 'exact_retry') => {
+    if (response.ok === false) {
+      await reconcileVerifiedRecoveryRejection(response, hubCapabilities, current.pendingOperation);
+      return;
+    }
+    if (response.ok !== true) {
+      setHubMessage('原始请求尚未得到可验证响应；保持同一 pending 密文并阻断新 RPC。');
+      return;
+    }
+    const operation = current.pendingOperation;
+    const result = asObject(response.result);
+    const session = asObject(await rpc('session.capabilities', {})) as
+      unknown as ClientHubSessionCapabilities;
+    setSessionCapabilities(session);
+    if (operation === 'intent.submit') {
+      rememberIntent(result);
+      const intentId = field(result, 'id');
+      if (intentId) {
+        setTab('work');
+        setExpandedIntentId(intentId);
+        setIntentHistoryMessage('原始 intent.submit 已由 Hub 加密确认接受；正在读取 Intent、Goal 与 Worker 权威状态。');
+        if (session.available_rpc_operations.includes('intent.status')) {
+          await refreshIntentStatus(intentId, hubCapabilities, session);
+        } else await refreshGoalResult(intentId, hubCapabilities, session);
+      }
+    }
+    if (operation === 'link.invite_create') setRecoveredInvite(result);
+    await refreshHubStatus();
+    await refreshRemoteData();
+    setHubMessage(operation === 'link.invite_create' ?
+      `已验证原始密文响应；一次性邀请 token 仅在管理页当前内存显示。来源：${source}。` :
+      operation === 'link.invite_accept' ?
+        `Hub 已确认原始邀请接受请求；请重读 link.list 核对 PROPOSED 提案。来源：${source}。` :
+        `已验证原始签名密文响应；权威状态已重新读取。来源：${source}。`);
   };
   const refreshStatusChanges = async (capabilities = hubCapabilities) => {
     const current = await clientHub.getStatus();
@@ -436,6 +580,7 @@ function Client(): React.JSX.Element {
       setStatusSnapshot(nextSnapshot || null);
       setSnapshotVerifiedAt(nextSnapshot ? Date.now() : 0);
       setStatusSyncError('');
+      if (nextSnapshot) await refreshHubStatus();
       if (includeManagement) {
         const nextTopology = await rpcIfAllowed('topology_management', 'topology.snapshot', {}, capabilities) as
           ClientTopologySnapshot | undefined;
@@ -565,6 +710,34 @@ function Client(): React.JSX.Element {
     } catch (error) { setHubMessage('设备登记/会话建立失败：' + safeHubError(error)); }
     finally { setHubBusy(false); }
   };
+  const recoverEnrollment = async () => {
+    if (!hubStatus.enrollmentRecoveryRequired || hubBusy || hubStatus.authFenced) return;
+    setHubBusy(true);
+    setHubMessage('正在用本机持久保存的原始登记请求恢复；不会签发新 Grant 或设备身份。');
+    let enrollmentRecovered = false;
+    try {
+      const enrollment = await clientHub.recoverEnrollment();
+      enrollmentRecovered = true;
+      setOwnerId(enrollment.ownerId);
+      setDeviceId(enrollment.deviceId);
+      setOwnerDeviceGrant('');
+      const session = asObject(await rpc('session.capabilities', {})) as
+        unknown as ClientHubSessionCapabilities;
+      setSessionCapabilities(session);
+      const current = await refreshHubStatus();
+      await refreshRemoteData(hubCapabilities || undefined);
+      setHubMessage(`已恢复同一设备登记响应 · epoch ${enrollment.sessionEpoch} · 已读取加密 session.capabilities。`);
+      if (current.enrollmentRecoveryRequired) {
+        setHubMessage('Hub 返回登记结果，但本机仍标记登记待恢复；保留原请求并停止新登记。');
+      }
+    } catch (error) {
+      const current = await clientHub.getStatus().catch(() => null);
+      if (current) setHubStatus(current);
+      setHubMessage(enrollmentRecovered ?
+        'Hub 已确认原设备登记；后续会话读取未完成：' + safeHubError(error) :
+        '原登记请求恢复未完成：' + safeHubError(error) + '。仍保留本机同一 Grant 和身份，可安全重试。');
+    } finally { setHubBusy(false); }
+  };
   const initializeHubSession = async () => {
     const current = await refreshHubStatus();
     if (current.authFenced) {
@@ -598,12 +771,11 @@ function Client(): React.JSX.Element {
     }
     if (!current.enrolled) return;
     try {
-      let recovered: JsonObject | undefined;
       if (current.pendingOperationId) {
-        recovered = asObject(await clientHub.recoverPending());
+        const recovered = asObject(await clientHub.recoverPending());
         const pending = recovered;
         if (pending.ok === false) {
-          await reconcileVerifiedRecoveryRejection(pending, capabilities);
+          await reconcileVerifiedRecoveryRejection(pending, capabilities, current.pendingOperation);
           return;
         }
         if (pending.ok !== true) {
@@ -615,20 +787,11 @@ function Client(): React.JSX.Element {
           setHubMessage('仍有未确定的原始加密请求；已停止新的 RPC，等待恢复结果。');
           return;
         }
+        await acceptRecoveredResponse(current, recovered, 'recover');
+        return;
       }
       const sessionResult = asObject(await rpc('session.capabilities', {}));
       setSessionCapabilities(sessionResult as unknown as ClientHubSessionCapabilities);
-      if (current.pendingOperation === 'intent.submit' && recovered?.ok === true) {
-        rememberIntent(asObject(recovered.result));
-        setHubMessage('先前提交的 Intent 已由 Hub 加密确认接受；其状态可在工作页中重新读取。');
-      }
-      if (current.pendingOperation === 'link.invite_create' && recovered?.ok === true) {
-        setRecoveredInvite(asObject(recovered.result));
-        setHubMessage('先前的一次性 Link 邀请已从原始密文响应恢复；请到管理页查看并妥善传递 token。');
-      }
-      if (current.pendingOperation === 'link.invite_accept' && recovered?.ok === true) {
-        setHubMessage('Hub 已确认先前的 Link 邀请接受请求；请在管理页重读 link.list 核对 PROPOSED 提案。');
-      }
       await refreshHubStatus();
       await refreshRemoteData(capabilities);
     } catch (error) { setHubMessage('无法恢复加密会话：' + safeHubError(error)); }
@@ -639,31 +802,76 @@ function Client(): React.JSX.Element {
     setHubBusy(true);
     try {
       const recovered = asObject(await clientHub.recoverPending());
-      if (recovered.ok === false) {
-        await reconcileVerifiedRecoveryRejection(recovered);
-        return;
-      }
-      if (recovered.ok !== true) {
-        setHubMessage('原始密文请求尚未得到可验证响应；新 RPC 保持关闭。');
-        return;
-      }
-      const sessionResult = asObject(await rpc('session.capabilities', {}));
-      setSessionCapabilities(sessionResult as unknown as ClientHubSessionCapabilities);
-      if (current.pendingOperation === 'intent.submit') {
-        rememberIntent(asObject(recovered.result));
-      }
-      if (current.pendingOperation === 'link.invite_create') {
-        setRecoveredInvite(asObject(recovered.result));
-      }
-      await refreshHubStatus();
-      await refreshRemoteData();
-      setHubMessage(current.pendingOperation === 'link.invite_create' ?
-        '已验证原始密文响应；一次性邀请 token 仅在管理页当前内存显示。' :
-        current.pendingOperation === 'link.invite_accept' ?
-          'Hub 已确认邀请接受请求；请在管理页重读 link.list 核对 PROPOSED 提案。' :
-          '已重发并验证原始密文响应；权威状态已重新读取。');
-    } catch (error) { setHubMessage('原始请求恢复失败：' + safeHubError(error)); }
+      await acceptRecoveredResponse(current, recovered, 'recover');
+    } catch (error) {
+      const latest = await clientHub.getStatus().catch(() => null);
+      if (latest) setHubStatus(latest);
+      setHubMessage('原始请求恢复失败：' + safeHubError(error));
+    }
     finally { setHubBusy(false); }
+  };
+
+  const retryPendingExact = () => {
+    if (hubStatus.sessionError !== 'RECOVERY_REJECTED' || !hubStatus.pendingOperationId || hubBusy) return;
+    Alert.alert('显式重发原始请求？',
+      'Hub 的恢复端没有这条请求记录。若原包从未到达 Hub，这次会执行原操作；若 Hub 曾接受请求，其重放保护会阻止再次执行。将原样发送本机保留的同一签名密文、operation ID 和序号，不创建新请求。', [
+        {text: '取消', style: 'cancel'},
+        {text: '原样重发一次', style: 'destructive', onPress: async () => {
+          setHubBusy(true);
+          try {
+            const current = await refreshHubStatus();
+            if (current.sessionError !== 'RECOVERY_REJECTED' || !current.pendingOperationId) {
+              throw new Error('RECOVERY_STATE_CHANGED');
+            }
+            const response = asObject(await clientHub.retryPendingExact());
+            await acceptRecoveredResponse(current, response, 'exact_retry');
+          } catch (error) {
+            const latest = await clientHub.getStatus().catch(() => null);
+            if (latest) setHubStatus(latest);
+            setHubMessage('原请求原样重发未完成：' + safeHubError(error) +
+              '。没有生成新的 operation；如仍有 pending，请先再次调用 /recover。');
+          } finally { setHubBusy(false); }
+        }},
+      ]);
+  };
+
+  const refreshAfterUncertainOutcome = async () => {
+    setHubBusy(true);
+    try {
+      let current = await refreshHubStatus();
+      if (current.pendingOperationId) {
+        setHubMessage('仍有待恢复的原始密文；先调用 /rpc/recover，再读取业务状态。');
+        return;
+      }
+      let capabilities = hubCapabilities;
+      if (!capabilities && current.baseUrl) {
+        const candidate = await clientHub.fetchHubMetadata({baseUrl: current.baseUrl});
+        setHubCandidate(candidate);
+        setHubCapabilities(candidate.capabilities);
+        capabilities = candidate.capabilities;
+      }
+      let session = sessionCapabilities;
+      if (!session && current.remoteEnabled && current.sessionCapabilitiesReady) {
+        session = asObject(await rpc('session.capabilities', {})) as
+          unknown as ClientHubSessionCapabilities;
+        setSessionCapabilities(session);
+        current = await refreshHubStatus();
+      }
+      await refreshRemoteData(capabilities || undefined);
+      if (session?.role === 'manager' && session.available_rpc_operations.includes('intent.list') &&
+          capsAllows(capabilities || null, 'control_intents', 'intent.list', current)) {
+        const intents = await intentRpc('intent.list', {}, capabilities, session);
+        if (Array.isArray(intents)) {
+          setIntentHistory(intents.map(asObject).slice(0, 200));
+          setIntentProgress({});
+          setIntentHistoryVisibleCount(8);
+          setIntentHistoryMessage('已重读权威 Intent 历史。OUTCOME_UNCERTAIN 未提供可验证 intent_id，因此不会猜测关联或查询 goal.result。');
+        }
+      }
+      setHubMessage('已刷新 Hub 权威状态。此操作的业务结果仍待核实；没有重发 Intent。');
+    } catch (error) {
+      setHubMessage('权威状态刷新失败：' + safeHubError(error));
+    } finally { setHubBusy(false); }
   };
 
   const submitIntent = async () => {
@@ -686,7 +894,8 @@ function Client(): React.JSX.Element {
     if (id) {
       rememberIntent(submitted);
       setExpandedIntentId(id);
-      setIntentHistoryMessage('新请求已由 Hub 持久接受；点开记录可读取最新分发状态。');
+      setTab('work');
+      setIntentHistoryMessage('Hub 已持久接受此 Intent；正在读取 Intent、Goal 与 Worker 状态。');
     }
     setDraft('');
     setCompose(false);
@@ -694,10 +903,15 @@ function Client(): React.JSX.Element {
     setHubMessage(id ? `请求已由 Hub 持久接受 · Intent ${id}` :
       'Hub 已验证 intent.submit 成功响应，但没有返回可读取的 Intent ID。');
     try {
+      if (id && intentOperationAvailable('intent.status')) await refreshIntentStatus(id);
+      else if (id) await refreshGoalResult(id);
       await refreshRemoteData();
+      if (id) setIntentHistoryMessage(goalResultAvailable() ?
+        '已读取 Intent 状态；Goal 与 Worker 结果来自独立的 goal.result。' :
+        '已读取当前授权的 Intent 状态；此加密会话没有提供 goal.result 权限。');
     } catch (error) {
       setHubMessage(id ?
-        `Intent ${id} 已由 Hub 持久接受；后续状态刷新失败：${safeHubError(error)}` :
+        `Intent ${id} 已由 Hub 持久接受；后续 Intent / Goal 状态读取失败：${safeHubError(error)}` :
         'Intent 已由 Hub 接受；后续状态刷新失败：' + safeHubError(error));
     }
     setHubBusy(false);
@@ -1155,6 +1369,7 @@ function Client(): React.JSX.Element {
       '距上次成功读取 Hub 快照已超过 5 分钟；下方状态可能已过期。';
     const intentHistoryAllowed = intentOperationAvailable('intent.list');
     const intentStatusAllowed = intentOperationAvailable('intent.status');
+    const intentGoalResultAllowed = goalResultAvailable();
     const clientDeviceListAllowed = capsAllows(hubCapabilities, 'client_device_management',
       'devices.list', hubStatus);
     const clientDeviceRevokeAllowed = capsAllows(hubCapabilities, 'client_device_management',
@@ -1315,6 +1530,9 @@ function Client(): React.JSX.Element {
       {intentHistoryAllowed && <>
         <Section name="Control 请求历史" action={intentHistoryBusy ? '读取中…' : '找回本人历史请求'}
           onPress={() => { if (!intentHistoryBusy) void fetchIntentHistory(); }} />
+        {hubStatus.outcomeUncertainOperationId && <Notice>
+          存在 Hub 已确认但业务结果未确定的操作 {hubStatus.outcomeUncertainOperationId}。Intent 列表按权威数据刷新；此操作无法从原包推断 intent_id。
+        </Notice>}
         <Notice>历史按需从 Hub 的 intent.list 读取；页面只保留并显示最近 200 条，再分批展开。当前服务端会返回当前 Owner 的全量记录，首次读取量仍随历史增长。正文仅保留在当前内存；撤权、固定其他 Hub 或创建新设备身份时清空。</Notice>
         {!!intentHistoryMessage && <Text style={s.small}>{intentHistoryMessage}</Text>}
         {intentHistory.length === 0 && !intentHistoryBusy && !intentHistoryMessage &&
@@ -1324,6 +1542,7 @@ function Client(): React.JSX.Element {
           const progress = intentProgress[id];
           const intent = progress ? asObject(progress.intent) : item;
           const job = progress ? asObject(progress.job) : {};
+          const goalResult = goalResults[id];
           const status = field(intent, 'status');
           const expanded = expandedIntentId === id;
           const result = status === 'resolved' && intent.result &&
@@ -1334,6 +1553,9 @@ function Client(): React.JSX.Element {
             if (intentStatusAllowed && id) {
               refreshIntentStatus(id).catch(error =>
                 setIntentHistoryMessage('权威状态读取失败：' + safeHubError(error)));
+            } else if (intentGoalResultAllowed && id) {
+              refreshGoalResult(id).catch(error =>
+                setIntentHistoryMessage('Goal / Worker 结果读取失败：' + safeHubError(error)));
             }
           }}>
             <View style={s.row}><Text style={s.cardTitle}>Intent {id}</Text>
@@ -1343,12 +1565,41 @@ function Client(): React.JSX.Element {
             <Text style={s.small}>创建：{field(intent, 'created_at') || '时间未知'} · 更新：{field(intent, 'updated_at') || '时间未知'}</Text>
             {expanded && <>
               <Text style={s.small}>Intent 业务状态：{intentStatusLabel(status)} · 来源：{progress ? 'Hub intent.status' : 'Hub intent.list'}</Text>
-              {progress && <Text style={s.small}>分发状态：{intentJobStatusLabel(field(job, 'state'))} · DONE 只表示分发完成，不表示 Goal 已完成。</Text>}
-              {!progress && intentStatusAllowed && <Text style={s.small}>点此记录可重读 intent.status；Goal 生命周期仍以工作状态快照为准。</Text>}
+              {progress && <Text style={s.small}>Intent 作业状态：{intentJobStatusLabel(field(job, 'state'))} · 这不代表 Goal 或 Worker 成功。</Text>}
+              {!progress && intentStatusAllowed && <Text style={s.small}>展开记录会重读 intent.status；有 manager 授权时再用 intent_id 查询 goal.result。</Text>}
               {!progress && !intentStatusAllowed && <Text style={s.small}>当前会话未授权 intent.status；以上字段来自 Hub intent.list。</Text>}
               {!!field(intent, 'question') && <Text style={s.description}>需要补充：{field(intent, 'question')}</Text>}
               {!!field(intent, 'error') && <Text style={s.description}>失败原因：{field(intent, 'error')}</Text>}
               {!!result && <Text style={s.small}>Control 结果：{result}</Text>}
+              {intentGoalResultAllowed && goalResult && <>
+                <Text style={s.small}>goal.result · Intent：{intentStatusLabel(goalResult.intent_status)}</Text>
+                <Text style={s.small}>Goal：{goalResult.goal_id || '尚未生成 Goal'} ·
+                  {goalResult.goal_status ? observationLabel({state: goalResult.goal_status, known: true}) : '暂无 Goal 终态'}</Text>
+                {!!goalResult.outcome && <Text style={s.small}>Goal outcome：{goalResult.outcome}</Text>}
+                {!!goalResult.summary && <Text style={s.description}>Goal 摘要：{goalResult.summary}</Text>}
+                {goalResult.workers.length > 0 && <>
+                  <Text style={s.small}>Worker 终态（{goalResult.workers.length}{goalResult.workers_truncated ? '+' : ''}）</Text>
+                  {goalResult.workers.map((worker, index) => <View key={`${worker.worker_id}-${index}`}>
+                    <Text style={s.small}>{worker.worker_id} · {observationLabel({state: worker.status, known: true})} · attempt {worker.attempt}</Text>
+                    {!!worker.summary && <Text style={s.small}>{worker.summary}</Text>}
+                  </View>)}
+                </>}
+                {goalResult.workers_truncated && <Text style={s.small}>Hub 已截断 Worker 摘要；完整详情需在受授权 Hub 面板查看。</Text>}
+                {goalResult.artifacts.length > 0 && <>
+                  <Text style={s.small}>Artifact 引用（仅元数据，不含文件内容或读取权限）</Text>
+                  {goalResult.artifacts.map((artifact, index) => <Text key={`${artifact.artifact_id}-${index}`} style={s.small}>
+                    {artifact.name} · {artifact.kind} · {artifact.status} · ref {artifact.artifact_id}
+                    {artifact.digest ? ` · digest ${artifact.digest}` : ''}
+                  </Text>)}
+                </>}
+                {goalResult.artifacts_truncated && <Text style={s.small}>Hub 已截断 Artifact 引用。</Text>}
+              </>}
+              {!intentGoalResultAllowed && <Text style={s.small}>
+                当前会话未同时提供 v1.2 manager 的 goal.result 授权；不展示推测的 Goal 或 Artifact 状态。
+              </Text>}
+              {intentGoalResultAllowed && !goalResult && <Text style={s.small}>
+                正在读取 goal.result；未返回 Goal 时只说明此 Intent 尚未生成 Goal。
+              </Text>}
             </>}
           </Card>;
         })}
@@ -1570,18 +1821,42 @@ function Client(): React.JSX.Element {
         {!!hubMessage && <Text style={s.small}>{hubMessage}</Text>}
         {hubStatus.enrollmentRecoveryRequired && <Notice>
           设备登记结果尚不确定：{hubStatus.pendingEnrollmentOwnerId || '未知 Owner'} ·
-          {hubStatus.pendingEnrollmentDeviceId || '未知 Device'}。已保留本机身份与登记摘要；
-          在 Hub 提供安全对账协议前，停止重复登记和更换设备身份。
+          {hubStatus.pendingEnrollmentDeviceId || '未知 Device'}。本机持久保存了原始 Grant 与登记请求；
+          用下方按钮原样重发同一登记请求，不要重新签发 Grant 或更换设备身份。
         </Notice>}
+        {hubStatus.enrollmentRecoveryRequired && <Button
+          title={hubBusy ? '正在恢复登记…' : '原样恢复设备登记'} secondary
+          onPress={() => { void recoverEnrollment(); }}
+          disabled={hubBusy || hubStatus.authFenced} />}
         {hubStatus.pendingOperationId && !hubStatus.authFenced && <>
           <Text style={s.small}>待恢复操作：{hubStatus.pendingOperation || '未知'} · {hubStatus.pendingOperationId}</Text>
-          {hubStatus.recoveryBlocked ?
-            <Notice>Hub 返回 HTTP 409，操作结果可能不确定。原始密文与计数已保留；
-              暂停重试及新操作，等待 Hub 的安全对账协议。</Notice> : <>
-              <Text style={s.small}>恢复只会逐字节重发 Hub 已记录的原始密文包；不会重建或自动重试新业务动作。</Text>
-              <View style={s.modelActions}><Button title="恢复原始加密请求" secondary
-                onPress={() => { void recoverPendingNow(); }} disabled={hubBusy} /></View>
-            </>}
+          {hubStatus.sessionError === 'STILL_PROCESSING' && <Notice>
+            Hub 仍在处理原请求。原包与计数保留；稍后再次调用 /rpc/recover，不创建新 operation。
+          </Notice>}
+          {hubStatus.sessionError === 'RECOVERY_UNAVAILABLE' && <Notice>
+            Hub 无法恢复这条旧请求的结果密文。Client 保留 pending 并阻断新操作；重复查询不会重发业务操作，需 Hub 维护者对账。
+          </Notice>}
+          {hubStatus.sessionError === 'RECOVERY_REJECTED' && <Notice>
+            Hub 的恢复端没有该请求记录。可以选择显式原样重发；若请求从未到达 Hub，这会执行原操作。重放保护会阻止已接受请求再次执行。
+          </Notice>}
+          {hubStatus.recoveryBlocked && !['STILL_PROCESSING', 'RECOVERY_UNAVAILABLE', 'RECOVERY_REJECTED']
+            .includes(hubStatus.sessionError || '') && <Notice>
+            上次恢复遇到冲突。原签名密文、operation ID 和序号仍保留；再次查询恢复状态不会创建新操作。
+          </Notice>}
+          <Text style={s.small}>先查询 /v2/client/rpc/recover；恢复仅使用同一原始签名密文和请求序号。</Text>
+          <View style={s.modelActions}><Button title={hubBusy ? '正在查询恢复状态…' : '再次查询原请求恢复'} secondary
+            onPress={() => { void recoverPendingNow(); }} disabled={hubBusy} /></View>
+          {hubStatus.sessionError === 'RECOVERY_REJECTED' && <Button title="原样重发一次（可能执行原操作）"
+            secondary onPress={retryPendingExact} disabled={hubBusy} />}
+        </>}
+        {hubStatus.outcomeUncertainOperationId && <>
+          <Notice>Hub 已用已验签密文响应确认 OUTCOME_UNCERTAIN：业务结果仍待核实。原传输 pending 已退休；没有重发 Intent，也不会把它标成成功。</Notice>
+          {hubStatus.uncertainNeedsReconciliation && <Text style={s.small}>
+            新管理写入暂时关闭，直到读取一次经过认证的 Hub 状态快照。
+          </Text>}
+          <Text style={s.small}>不确定 operation：{hubStatus.outcomeUncertainOperationId}</Text>
+          <Button title={hubBusy ? '正在重读状态…' : '刷新权威状态与 Intent 历史'} secondary
+            onPress={() => { void refreshAfterUncertainOutcome(); }} disabled={hubBusy} />
         </>}
         {hubStatus.enrolled && !hubStatus.sessionCapabilitiesReady &&
           <View style={s.modelActions}><Button title="恢复加密会话" secondary
@@ -1646,7 +1921,8 @@ function Client(): React.JSX.Element {
       <Section name="3 · 生成手机设备身份" />
       <Text style={s.description}>设备私钥由 Android 安全适配生成并留在设备；UI 只展示公钥身份。Owner 必须在可信外部批准工具中独立签发绑定此公钥、Hub、设备 ID 和期限的 OwnerDeviceGrant。</Text>
       {!hubStatus.authFenced && <Button title="生成 / 读取设备公钥身份" onPress={() => { void createDeviceIdentity(); }}
-        secondary={!hubStatus.pinned || hubBusy} disabled={!hubStatus.pinned || hubBusy} />}
+        secondary={!hubStatus.pinned || hubBusy || hubStatus.enrollmentRecoveryRequired}
+        disabled={!hubStatus.pinned || hubBusy || hubStatus.enrollmentRecoveryRequired} />}
       {!!deviceIdentityJson && <Card>
         <Text style={s.cardTitle}>设备公钥身份</Text>
         <Text selectable style={s.mono}>{deviceIdentityJson}</Text>

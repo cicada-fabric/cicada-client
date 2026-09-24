@@ -66,6 +66,9 @@ class ClientHubNativeModule(context: ReactApplicationContext) : ReactContextBase
     }
 
     @com.facebook.react.bridge.ReactMethod
+    fun recoverEnrollment(promise: Promise) = run(promise) { session.recoverEnrollment() }
+
+    @com.facebook.react.bridge.ReactMethod
     fun rpc(options: ReadableMap, promise: Promise) = run(promise) {
         val operation = requiredString(options, "operation")
         val body = options.getMap("body")?.let(::readableMapToJson)
@@ -76,6 +79,9 @@ class ClientHubNativeModule(context: ReactApplicationContext) : ReactContextBase
 
     @com.facebook.react.bridge.ReactMethod
     fun recoverPending(promise: Promise) = run(promise) { session.recoverPending() }
+
+    @com.facebook.react.bridge.ReactMethod
+    fun retryPendingExact(promise: Promise) = run(promise) { session.retryPendingExact() }
 
     private fun run(promise: Promise, action: () -> JsonObject) {
         try {

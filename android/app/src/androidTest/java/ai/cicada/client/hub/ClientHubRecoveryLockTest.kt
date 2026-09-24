@@ -49,7 +49,7 @@ class ClientHubRecoveryLockTest {
 
             // The pin uses an unreachable loopback endpoint. The precise local guard error
             // proves recovery stopped before parsing keys, opening HTTP, or changing state.
-            expectError("RECOVERY_PROTOCOL_REQUIRED") { restored.recoverPending() }
+            expectError("RECOVERY_SEQUENCE_UNAVAILABLE") { restored.recoverPending() }
             assertUnchanged(sandbox.stateFile, initialStateBytes)
 
             expectError("PENDING_RECOVERY_REQUIRED") { restored.startNewDeviceEnrollment() }
@@ -104,6 +104,7 @@ class ClientHubRecoveryLockTest {
             expectError("ENROLLMENT_RECOVERY_REQUIRED") {
                 restored.enroll("", "", "{}", "", "not-a-grant")
             }
+            expectError("ENROLLMENT_RECOVERY_UNAVAILABLE") { restored.recoverEnrollment() }
             assertUnchanged(sandbox.stateFile, initialStateBytes)
 
             expectError("ENROLLMENT_RECOVERY_REQUIRED") {
@@ -126,6 +127,37 @@ class ClientHubRecoveryLockTest {
             assertFalse(after.get("enrolled").asBoolean)
             assertUnchanged(sandbox.stateFile, initialStateBytes)
             assertUnchanged(sandbox.wrappedDeviceKeyFile, wrappedKeyBytes)
+        } finally {
+            sandbox.root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun authenticatedUncertainOutcomeRequiresSnapshotBeforeAnotherWrite() {
+        val sandbox = sandbox()
+        try {
+            val controlPublic = ClientWireCrypto.Identity.generate().use { it.publicIdentity }
+            ClientHubSession(sandbox.context).createDeviceIdentity()
+            val saved = pendingState(controlPublic.toJson(), "unused").apply {
+                remove("pending")
+                addProperty("recoveryBlocked", false)
+                addProperty("sessionError", "OUTCOME_UNCERTAIN")
+                addProperty("outcomeUncertainOperationId", "prior-uncertain-operation")
+                addProperty("uncertainNeedsReconciliation", true)
+                add("allowedOperations", JsonArray().apply {
+                    add("session.capabilities")
+                    add("status.snapshot")
+                    add("topology.apply")
+                })
+            }
+            writeState(sandbox.stateFile, saved)
+            val before = sandbox.stateFile.readBytes()
+            val session = ClientHubSession(sandbox.context)
+            assertTrue(session.getStatus().get("uncertainNeedsReconciliation").asBoolean)
+            expectError("BUSINESS_RECONCILIATION_REQUIRED") {
+                session.rpc("topology.apply", JsonObject())
+            }
+            assertUnchanged(sandbox.stateFile, before)
         } finally {
             sandbox.root.deleteRecursively()
         }
@@ -238,7 +270,7 @@ class ClientHubRecoveryLockTest {
     }
 
     private companion object {
-        const val CONTRACT_REVISION = "client-hub-v1.1"
-        const val CATALOG_SHA256 = "f6f05783ddc00e51b92ebe050b5d8e6b9b185fae80d8fc6f04bc3143b6782374"
+        const val CONTRACT_REVISION = "client-hub-v1.2"
+        const val CATALOG_SHA256 = "613084ee67f75d27762ddaf59ec2e5b33ebea7383cbfcf455a50b472e756c66a"
     }
 }

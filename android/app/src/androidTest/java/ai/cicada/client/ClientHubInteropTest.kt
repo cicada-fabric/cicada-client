@@ -64,15 +64,15 @@ class ClientHubInteropTest {
             badSource.get("ok").asBoolean)
     }
 
-    @Test fun currentV11ExternalReadsUseEncryptedCapabilitiesAndKeepKeyRpcDisabled() {
+    @Test fun currentV12ExternalReadsUseEncryptedCapabilitiesAndKeepKeyRpcDisabled() {
         val before = session.getStatus()
         assertTrue(before.get("remoteEnabled").asBoolean)
         val cap = session.rpc("session.capabilities", JsonObject())
         assertTrue(cap.get("ok").asBoolean)
         val result = cap.getAsJsonObject("result")
         assertEquals("external", result.get("role").asString)
-        assertEquals("client-hub-v1.1", result.get("contract_revision").asString)
-        assertEquals("f6f05783ddc00e51b92ebe050b5d8e6b9b185fae80d8fc6f04bc3143b6782374",
+        assertEquals("client-hub-v1.2", result.get("contract_revision").asString)
+        assertEquals("613084ee67f75d27762ddaf59ec2e5b33ebea7383cbfcf455a50b472e756c66a",
             result.get("catalog_sha256").asString)
 
         val allowed = session.getStatus().getAsJsonArray("allowedOperations").map { it.asString }
@@ -150,7 +150,7 @@ class ClientHubInteropTest {
             val restored = ClientHubSession(context)
             assertEquals(pendingId, restored.getStatus().get("pendingOperationId").asString)
             for ((expected, action) in listOf<Pair<String, () -> Unit>>(
-                "RECOVERY_PROTOCOL_REQUIRED" to { restored.recoverPending() },
+                "HTTP_409_RECOVERY_REJECTED" to { restored.recoverPending() },
                 "PENDING_RECOVERY_REQUIRED" to {
                     restored.rpc("status.snapshot", JsonObject())
                 },
@@ -243,7 +243,7 @@ class ClientHubInteropTest {
     @Test fun insecureTransportAndUnknownRpcAreRejectedBeforeNetwork() {
         val before = session.getStatus()
         assertTrue(before.get("remoteEnabled").asBoolean)
-        listOf("http://example.com", "http://10.0.2.2:8789").forEach { url ->
+        listOf("http://example.com", "http://10.0.2.2:8791").forEach { url ->
             try {
                 session.fetchHubMetadata(url)
                 fail("Debug build accepted an unapproved HTTP Hub URL")
@@ -296,8 +296,8 @@ class ClientHubInteropTest {
         val cap = session.rpc("session.capabilities", JsonObject(), "android-capabilities-1")
         assertTrue(cap.get("ok").asBoolean)
         assertEquals(expectedRole, cap.getAsJsonObject("result").get("role").asString)
-        assertEquals("client-hub-v1.1", cap.getAsJsonObject("result").get("contract_revision").asString)
-        assertEquals("f6f05783ddc00e51b92ebe050b5d8e6b9b185fae80d8fc6f04bc3143b6782374",
+        assertEquals("client-hub-v1.2", cap.getAsJsonObject("result").get("contract_revision").asString)
+        assertEquals("613084ee67f75d27762ddaf59ec2e5b33ebea7383cbfcf455a50b472e756c66a",
             cap.getAsJsonObject("result").get("catalog_sha256").asString)
         val snapshot = session.rpc("status.snapshot", JsonObject(), "android-snapshot-2")
         assertTrue(snapshot.get("ok").asBoolean)
@@ -313,6 +313,57 @@ class ClientHubInteropTest {
         assertFalse(status.has("pendingOperationId"))
     }
 
+    @Test fun lostEnrollment201ReplaysPersistedGrantAfterSessionReconstruction() {
+        val trustedHub = JsonParser.parseString(decoded("trusted_hub_identity_base64")).asJsonObject
+        val baseUrl = argument("hub_base_url")
+        session.pinHub(baseUrl, trustedHub.get("hub_id").asString,
+            trustedHub.getAsJsonObject("control_public_identity").toString())
+        try {
+            session.enroll(argument("owner_id"), argument("owner_key_id"),
+                decoded("owner_public_identity_base64"), argument("device_id"),
+                argument("owner_device_grant_base64"))
+            fail("Fault proxy did not discard the accepted HTTP 201 response")
+        } catch (error: HubSessionException) {
+            assertEquals("NETWORK_ERROR", error.errorCode)
+        }
+        val waiting = session.getStatus()
+        assertTrue(waiting.get("enrollmentRecoveryRequired").asBoolean)
+        assertFalse(waiting.get("enrolled").asBoolean)
+        val resumed = ClientHubSession(instrumentation.targetContext)
+        val recovered = resumed.recoverEnrollment()
+        assertEquals("ACTIVE", recovered.get("state").asString)
+        assertEquals(1L, recovered.get("sessionEpoch").asLong)
+        assertEquals(1L, recovered.get("deviceKeyVersion").asLong)
+        val cap = resumed.rpc("session.capabilities", JsonObject())
+        assertTrue(cap.get("ok").asBoolean)
+        assertEquals("client-hub-v1.2", cap.getAsJsonObject("result")
+            .get("contract_revision").asString)
+        assertEquals("613084ee67f75d27762ddaf59ec2e5b33ebea7383cbfcf455a50b472e756c66a",
+            cap.getAsJsonObject("result").get("catalog_sha256").asString)
+        assertFalse(resumed.getStatus().get("enrollmentRecoveryRequired").asBoolean)
+    }
+
+    @Test fun lostRpc200RecoversSameEncryptedResponseWithoutNewOperation() {
+        val initial = session.getStatus()
+        assertTrue(initial.get("remoteEnabled").asBoolean)
+        val operationId = "android-v12-lost-response-${UUID.randomUUID()}"
+        try {
+            session.rpc("status.snapshot", JsonObject(), operationId)
+            fail("Fault proxy did not discard the accepted encrypted RPC response")
+        } catch (error: HubSessionException) {
+            assertEquals("NETWORK_ERROR", error.errorCode)
+        }
+        val waiting = session.getStatus()
+        assertEquals(operationId, waiting.get("pendingOperationId").asString)
+        val beforeSequence = waiting.get("nextSequence").asLong
+        val resumed = ClientHubSession(instrumentation.targetContext)
+        val recovered = resumed.recoverPending()
+        assertTrue(recovered.get("ok").asBoolean)
+        assertEquals(operationId, recovered.get("operationId").asString)
+        assertEquals(beforeSequence, resumed.getStatus().get("nextSequence").asLong)
+        assertFalse(resumed.getStatus().has("pendingOperationId"))
+    }
+
     @Test fun offlineLeavesExactPending() {
         val operationId = "android-offline-" + java.util.UUID.randomUUID()
         try {
@@ -325,13 +376,21 @@ class ClientHubInteropTest {
         assertEquals(operationId, status.get("pendingOperationId").asString)
     }
 
-    @Test fun recoverAfterOnline() {
+    @Test fun unacceptedOfflineRequestRequiresExplicitExactRetry() {
         val before = session.getStatus()
         val operationId = before.get("pendingOperationId").asString
         assertTrue(operationId.startsWith("android-offline-"))
-        val result = session.recoverPending()
-        assertTrue(result.get("ok").asBoolean)
-        assertEquals(operationId, result.get("operationId").asString)
+        try {
+            session.recoverPending()
+            fail("Recovery route dispatched an unaccepted request")
+        } catch (error: HubSessionException) {
+            assertEquals("HTTP_409_RECOVERY_REJECTED", error.errorCode)
+        }
+        assertEquals(operationId, session.getStatus().get("pendingOperationId").asString)
+        assertEquals("RECOVERY_REJECTED", session.getStatus().get("sessionError").asString)
+        val retried = session.retryPendingExact()
+        assertTrue(retried.get("ok").asBoolean)
+        assertEquals(operationId, retried.get("operationId").asString)
         assertFalse(session.getStatus().has("pendingOperationId"))
     }
 
@@ -371,7 +430,7 @@ class ClientHubInteropTest {
 
     @Test fun managerOperationsAgainstHub() {
         val trustedHub = JsonParser.parseString(decoded("trusted_hub_identity_base64")).asJsonObject
-        session.pinHub("http://10.0.2.2:8787", trustedHub.get("hub_id").asString,
+        session.pinHub(arguments.getString("hub_base_url") ?: "http://10.0.2.2:8789", trustedHub.get("hub_id").asString,
             trustedHub.getAsJsonObject("control_public_identity").toString())
         assertEquals("ACTIVE", session.enroll(
             argument("owner_id"), argument("owner_key_id"),
@@ -593,6 +652,16 @@ class ClientHubInteropTest {
             Thread.sleep(100)
         }
         val id = goalId ?: error("Intent did not resolve to a remote queued Goal")
+        val boundedResult = session.rpc("goal.result", JsonObject().apply {
+            addProperty("intent_id", intentId)
+        })
+        assertTrue(boundedResult.get("ok").asBoolean)
+        val resultBody = boundedResult.getAsJsonObject("result")
+        assertEquals(intentId, resultBody.get("intent_id").asString)
+        assertEquals(id, resultBody.get("goal_id").asString)
+        assertEquals("queued", resultBody.getAsJsonArray("workers").first().asJsonObject
+            .get("status").asString)
+        assertTrue(resultBody.get("artifacts").isJsonArray)
         fun goalSnapshot(): JsonObject {
             val snapshot = session.rpc("status.snapshot", JsonObject())
             assertTrue(snapshot.get("ok").asBoolean)
@@ -640,6 +709,62 @@ class ClientHubInteropTest {
         assertTrue(finalPause.get("ok").asBoolean)
         assertEquals("paused", goalSnapshot().getAsJsonObject("goal_lifecycle")
             .get("state").asString)
+    }
+
+    @Test fun submitGoalForNodeResultInterop() {
+        val nodeId = argument("disposable_node_id")
+        require(nodeId.startsWith("client-test-node-"))
+        val marker = "Android v1.2 bounded result " + System.currentTimeMillis()
+        val accepted = session.rpc("intent.submit", JsonObject().apply {
+            addProperty("text", marker)
+            addProperty("kind", "goal")
+            add("goal", JsonObject().apply {
+                addProperty("objective", marker)
+                addProperty("success_criteria", "Return a short completion summary")
+                addProperty("constraints", "Do not modify files or contact external services")
+                addProperty("machine_id", nodeId)
+                addProperty("harness", "codex")
+            })
+        })
+        assertTrue(accepted.get("ok").asBoolean)
+        val intentId = accepted.getAsJsonObject("result").get("id").asString
+        var workerId: String? = null
+        for (attempt in 0 until 50) {
+            val progress = session.rpc("intent.status", JsonObject().apply { addProperty("intent_id", intentId) })
+            assertTrue(progress.get("ok").asBoolean)
+            val body = session.rpc("goal.result", JsonObject().apply { addProperty("intent_id", intentId) })
+            assertTrue(body.get("ok").asBoolean)
+            val result = body.getAsJsonObject("result")
+            if (result.has("goal_id") && result.getAsJsonArray("workers").size() > 0) {
+                val worker = result.getAsJsonArray("workers").first().asJsonObject
+                assertEquals("queued", worker.get("status").asString)
+                workerId = worker.get("worker_id").asString
+                break
+            }
+            Thread.sleep(100)
+        }
+        assertNotNull("Goal/Worker did not become queued", workerId)
+        publish("interop_intent_id", intentId)
+        publish("interop_worker_id", workerId!!)
+    }
+
+    @Test fun completedGoalResultIsIndependentOfIntentDone() {
+        val intentId = argument("interop_intent_id")
+        val workerId = argument("interop_worker_id")
+        val progress = session.rpc("intent.status", JsonObject().apply { addProperty("intent_id", intentId) })
+        assertTrue(progress.get("ok").asBoolean)
+        assertEquals("DONE", progress.getAsJsonObject("result").getAsJsonObject("job")
+            .get("state").asString)
+        val bounded = session.rpc("goal.result", JsonObject().apply { addProperty("intent_id", intentId) })
+        assertTrue(bounded.get("ok").asBoolean)
+        val result = bounded.getAsJsonObject("result")
+        assertEquals(intentId, result.get("intent_id").asString)
+        val worker = result.getAsJsonArray("workers").firstOrNull { item ->
+            item.asJsonObject.get("worker_id").asString == workerId
+        }?.asJsonObject ?: error("Worker missing from bounded goal.result")
+        assertEquals("completed", worker.get("status").asString)
+        assertEquals("Node protocol fixture completed a bounded task", worker.get("summary").asString)
+        assertTrue(result.get("artifacts").isJsonArray)
     }
 
     @Test fun revokeDisposableNodeAfterQueuedGoal() {
