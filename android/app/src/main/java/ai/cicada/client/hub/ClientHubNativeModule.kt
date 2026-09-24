@@ -1,0 +1,193 @@
+package ai.cicada.client.hub
+
+import com.facebook.react.ReactPackage
+import com.facebook.react.bridge.Arguments
+import com.facebook.react.bridge.NativeModule
+import com.facebook.react.bridge.Promise
+import com.facebook.react.bridge.ReactApplicationContext
+import com.facebook.react.bridge.ReactContextBaseJavaModule
+import com.facebook.react.bridge.ReadableArray
+import com.facebook.react.bridge.ReadableMap
+import com.facebook.react.bridge.ReadableType
+import com.facebook.react.bridge.WritableArray
+import com.facebook.react.bridge.WritableMap
+import com.facebook.react.uimanager.ViewManager
+import com.google.gson.JsonArray
+import com.google.gson.JsonElement
+import com.google.gson.JsonNull
+import com.google.gson.JsonObject
+import com.google.gson.JsonParser
+import com.google.gson.JsonPrimitive
+import java.math.BigDecimal
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
+
+/** Narrow React Native bridge. All cryptography and networking stay native. */
+class ClientHubNativeModule(context: ReactApplicationContext) : ReactContextBaseJavaModule(context) {
+    private val worker: ExecutorService = Executors.newSingleThreadExecutor { task ->
+        Thread(task, "cicada-client-hub").apply { isDaemon = true }
+    }
+    private val session by lazy(LazyThreadSafetyMode.SYNCHRONIZED) { ClientHubSession(reactApplicationContext) }
+
+    override fun getName(): String = "CicadaClientHub"
+
+    @com.facebook.react.bridge.ReactMethod
+    fun getStatus(promise: Promise) = run(promise) { session.getStatus() }
+
+    @com.facebook.react.bridge.ReactMethod
+    fun fetchHubMetadata(options: ReadableMap, promise: Promise) = run(promise) {
+        session.fetchHubMetadata(requiredString(options, "baseUrl"))
+    }
+
+    @com.facebook.react.bridge.ReactMethod
+    fun pinHub(options: ReadableMap, promise: Promise) = run(promise) {
+        session.pinHub(
+            requiredString(options, "baseUrl"),
+            requiredString(options, "hubId"),
+            requiredString(options, "controlPublicIdentityJson"),
+        )
+    }
+
+    @com.facebook.react.bridge.ReactMethod
+    fun createDeviceIdentity(promise: Promise) = run(promise) { session.createDeviceIdentity() }
+
+    @com.facebook.react.bridge.ReactMethod
+    fun startNewDeviceEnrollment(promise: Promise) = run(promise) { session.startNewDeviceEnrollment() }
+
+    @com.facebook.react.bridge.ReactMethod
+    fun enroll(options: ReadableMap, promise: Promise) = run(promise) {
+        session.enroll(
+            requiredString(options, "ownerId"),
+            requiredString(options, "ownerKeyId"),
+            requiredString(options, "ownerPublicIdentityJson"),
+            requiredString(options, "deviceId"),
+            requiredString(options, "ownerDeviceGrantBase64"),
+        )
+    }
+
+    @com.facebook.react.bridge.ReactMethod
+    fun rpc(options: ReadableMap, promise: Promise) = run(promise) {
+        val operation = requiredString(options, "operation")
+        val body = options.getMap("body")?.let(::readableMapToJson)
+            ?: throw HubSessionException("INVALID_RPC_BODY", "Encrypted RPC body must be a JSON object")
+        val operationId = optionalString(options, "operationId")
+        session.rpc(operation, body, operationId)
+    }
+
+    @com.facebook.react.bridge.ReactMethod
+    fun recoverPending(promise: Promise) = run(promise) { session.recoverPending() }
+
+    private fun run(promise: Promise, action: () -> JsonObject) {
+        try {
+            worker.execute {
+                try {
+                    promise.resolve(jsonToWritable(action()))
+                } catch (error: HubSessionException) {
+                    promise.reject(error.errorCode, error.message, error)
+                } catch (_: Exception) {
+                    promise.reject("CLIENT_HUB_ERROR", "Client Hub operation failed")
+                }
+            }
+        } catch (_: Exception) {
+            promise.reject("CLIENT_HUB_UNAVAILABLE", "Client Hub worker is unavailable")
+        }
+    }
+
+    private fun requiredString(map: ReadableMap, key: String): String = optionalString(map, key)
+        ?: throw HubSessionException("INVALID_ARGUMENT", "Missing required argument: $key")
+
+    private fun optionalString(map: ReadableMap, key: String): String? = try {
+        if (!map.hasKey(key) || map.isNull(key)) null else map.getString(key)
+    } catch (_: Exception) {
+        throw HubSessionException("INVALID_ARGUMENT", "Argument $key must be a string")
+    }
+
+    private fun readableMapToJson(map: ReadableMap): JsonObject {
+        val result = JsonObject()
+        val keys = map.keySetIterator()
+        while (keys.hasNextKey()) {
+            val key = keys.nextKey()
+            result.add(key, readableValueToJson(map, key))
+        }
+        return result
+    }
+
+    private fun readableArrayToJson(array: ReadableArray): JsonArray {
+        val result = JsonArray()
+        for (index in 0 until array.size()) {
+            result.add(when (array.getType(index)) {
+                ReadableType.Null -> JsonNull.INSTANCE
+                ReadableType.Boolean -> JsonPrimitive(array.getBoolean(index))
+                ReadableType.Number -> numberToJson(array.getDouble(index))
+                ReadableType.String -> JsonPrimitive(array.getString(index))
+                ReadableType.Map -> array.getMap(index)?.let(::readableMapToJson) ?: JsonNull.INSTANCE
+                ReadableType.Array -> array.getArray(index)?.let(::readableArrayToJson) ?: JsonNull.INSTANCE
+            })
+        }
+        return result
+    }
+
+    private fun readableValueToJson(map: ReadableMap, key: String): JsonElement = when (map.getType(key)) {
+        ReadableType.Null -> JsonNull.INSTANCE
+        ReadableType.Boolean -> JsonPrimitive(map.getBoolean(key))
+        ReadableType.Number -> numberToJson(map.getDouble(key))
+        ReadableType.String -> JsonPrimitive(map.getString(key))
+        ReadableType.Map -> map.getMap(key)?.let(::readableMapToJson) ?: JsonNull.INSTANCE
+        ReadableType.Array -> map.getArray(key)?.let(::readableArrayToJson) ?: JsonNull.INSTANCE
+    }
+
+    private fun numberToJson(number: Double): JsonPrimitive {
+        if (!number.isFinite()) throw HubSessionException("INVALID_RPC_BODY", "RPC numbers must be finite")
+        if (number == kotlin.math.floor(number) && number >= Long.MIN_VALUE.toDouble() && number < Long.MAX_VALUE.toDouble()) {
+            return JsonPrimitive(number.toLong())
+        }
+        return JsonPrimitive(BigDecimal.valueOf(number))
+    }
+
+    private fun jsonToWritable(value: JsonElement): Any? = when {
+        value.isJsonNull -> null
+        value.isJsonObject -> {
+            val result = Arguments.createMap()
+            for ((key, child) in value.asJsonObject.entrySet()) put(result, key, child)
+            result
+        }
+        value.isJsonArray -> {
+            val result = Arguments.createArray()
+            value.asJsonArray.forEach { push(result, it) }
+            result
+        }
+        value.asJsonPrimitive.isBoolean -> value.asBoolean
+        value.asJsonPrimitive.isString -> value.asString
+        value.asJsonPrimitive.isNumber -> value.asDouble
+        else -> null
+    }
+
+    private fun put(map: WritableMap, key: String, value: JsonElement) {
+        when {
+            value.isJsonNull -> map.putNull(key)
+            value.isJsonObject -> map.putMap(key, jsonToWritable(value) as WritableMap)
+            value.isJsonArray -> map.putArray(key, jsonToWritable(value) as WritableArray)
+            value.asJsonPrimitive.isBoolean -> map.putBoolean(key, value.asBoolean)
+            value.asJsonPrimitive.isString -> map.putString(key, value.asString)
+            value.asJsonPrimitive.isNumber -> map.putDouble(key, value.asDouble)
+        }
+    }
+
+    private fun push(array: WritableArray, value: JsonElement) {
+        when {
+            value.isJsonNull -> array.pushNull()
+            value.isJsonObject -> array.pushMap(jsonToWritable(value) as WritableMap)
+            value.isJsonArray -> array.pushArray(jsonToWritable(value) as WritableArray)
+            value.asJsonPrimitive.isBoolean -> array.pushBoolean(value.asBoolean)
+            value.asJsonPrimitive.isString -> array.pushString(value.asString)
+            value.asJsonPrimitive.isNumber -> array.pushDouble(value.asDouble)
+        }
+    }
+}
+
+class ClientHubNativePackage : ReactPackage {
+    override fun createNativeModules(reactContext: ReactApplicationContext): List<NativeModule> =
+        listOf(ClientHubNativeModule(reactContext))
+
+    override fun createViewManagers(reactContext: ReactApplicationContext): List<ViewManager<*, *>> = emptyList()
+}

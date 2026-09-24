@@ -1,0 +1,662 @@
+package ai.cicada.client
+
+import ai.cicada.client.hub.ClientHubSession
+import ai.cicada.client.hub.HubSessionException
+import android.content.Context
+import android.content.ContextWrapper
+import android.os.Bundle
+import android.util.Base64
+import androidx.test.ext.junit.runners.AndroidJUnit4
+import androidx.test.platform.app.InstrumentationRegistry
+import com.google.gson.JsonObject
+import com.google.gson.JsonParser
+import org.junit.Assert.*
+import org.junit.Test
+import org.junit.runner.RunWith
+import java.io.File
+import java.nio.charset.StandardCharsets
+import java.util.UUID
+
+/** Against the separately running Docker Hub, using the APK's actual Kotlin session code. */
+@RunWith(AndroidJUnit4::class)
+class ClientHubInteropTest {
+    private val instrumentation get() = InstrumentationRegistry.getInstrumentation()
+    private val session get() = ClientHubSession(instrumentation.targetContext)
+    private val arguments get() = InstrumentationRegistry.getArguments()
+
+    private fun argument(name: String): String = arguments.getString(name)
+        ?: error("Instrumentation argument $name is required")
+
+    private fun decoded(name: String): String = String(
+        Base64.decode(argument(name), Base64.NO_WRAP), StandardCharsets.UTF_8,
+    )
+
+    private fun publish(name: String, value: String) {
+        instrumentation.sendStatus(0, Bundle().apply { putString(name, value) })
+    }
+
+    @Test fun linkProposalReadAndUnauthorizedSourceAreEncryptedBusinessResults() {
+        val before = session.getStatus()
+        assertTrue("Enrolled manager session is required", before.get("remoteEnabled").asBoolean)
+        val capabilities = session.rpc("session.capabilities", JsonObject())
+        assertTrue(capabilities.get("ok").asBoolean)
+        val operations = capabilities.getAsJsonObject("result")
+            .getAsJsonArray("available_rpc_operations").map { it.asString }
+        assertTrue(operations.contains("link.list"))
+        assertTrue(operations.contains("link.invite_create"))
+        val listed = session.rpc("link.list", JsonObject().apply { addProperty("limit", 50) })
+        assertTrue(listed.get("ok").asBoolean)
+        assertTrue(listed.getAsJsonObject("result").get("links").isJsonArray)
+        val badPreview = session.rpc("link.invite_preview", JsonObject().apply {
+            addProperty("token", "invalid-test-token")
+        })
+        assertFalse("Invalid bearer must be rejected inside the encrypted result",
+            badPreview.get("ok").asBoolean)
+        val badSource = session.rpc("link.invite_create", JsonObject().apply {
+            addProperty("source_endpoint_id", "ep_not_owned_by_android_test")
+            addProperty("source_group_id", "gr_not_owned_by_android_test")
+            addProperty("hub_id", before.get("hubId").asString)
+            add("actions", JsonParser.parseString("[\"ask\",\"reply\"]"))
+            add("data_scopes", JsonParser.parseString("[\"benchmark.public_result\"]"))
+            addProperty("expires_at", java.time.Instant.now().plusSeconds(1800).toString())
+        })
+        assertFalse("A non-owned source must not create an invitation",
+            badSource.get("ok").asBoolean)
+    }
+
+    @Test fun currentV11ExternalReadsUseEncryptedCapabilitiesAndKeepKeyRpcDisabled() {
+        val before = session.getStatus()
+        assertTrue(before.get("remoteEnabled").asBoolean)
+        val cap = session.rpc("session.capabilities", JsonObject())
+        assertTrue(cap.get("ok").asBoolean)
+        val result = cap.getAsJsonObject("result")
+        assertEquals("external", result.get("role").asString)
+        assertEquals("client-hub-v1.1", result.get("contract_revision").asString)
+        assertEquals("f6f05783ddc00e51b92ebe050b5d8e6b9b185fae80d8fc6f04bc3143b6782374",
+            result.get("catalog_sha256").asString)
+
+        val allowed = session.getStatus().getAsJsonArray("allowedOperations").map { it.asString }
+        assertTrue(allowed.contains("status.snapshot"))
+        assertTrue(allowed.contains("status.changes"))
+        for (operation in listOf("link.key_manifest", "link.key_grants", "link.key_grant",
+            "group.key_manifest", "group.key_grant", "group.key_status")) {
+            assertFalse("Unverified key operation is not callable: $operation", allowed.contains(operation))
+            try {
+                session.rpc(operation, JsonObject())
+                fail("Unverified key operation reached the Hub: $operation")
+            } catch (error: HubSessionException) {
+                assertEquals("UNSUPPORTED_RPC_OPERATION", error.errorCode)
+            }
+        }
+
+        val snapshot = session.rpc("status.snapshot", JsonObject())
+        assertTrue(snapshot.get("ok").asBoolean)
+        assertEquals("owner_attributed_v2", snapshot.getAsJsonObject("result")
+            .get("scope_mode").asString)
+        val changes = session.rpc("status.changes", JsonObject().apply {
+            addProperty("limit", 50)
+        })
+        assertTrue(changes.get("ok").asBoolean)
+        assertEquals("partial", changes.getAsJsonObject("result")
+            .get("completeness").asString)
+        assertFalse(session.getStatus().has("pendingOperationId"))
+    }
+
+    @Test fun realHubReplayConflictFreezesAnIsolatedAndroidSession() {
+        val target = instrumentation.targetContext
+        val liveDir = File(target.noBackupFilesDir, "client-hub")
+        val liveState = JsonParser.parseString(
+            File(liveDir, "session-state.json").readText(StandardCharsets.UTF_8),
+        ).asJsonObject
+        val replaySequence = liveState.get("lastResponseSequence").asLong
+        assertTrue("A prior authenticated RPC is required", replaySequence > 0)
+        assertFalse("Do not clone an unresolved live RPC", liveState.has("pending"))
+        assertTrue(liveState.get("sessionCapabilitiesReady").asBoolean)
+
+        // Clone only encrypted Android private storage into an isolated test context.
+        // Reusing an older sequence with a newly sealed packet must hit the real
+        // Hub replay guard; the enrolled app's own counters remain untouched.
+        val root = File(target.cacheDir, "client-hub-replay-${UUID.randomUUID()}")
+        val cloneDir = File(root, "client-hub")
+        assertTrue(cloneDir.mkdirs())
+        try {
+            liveState.addProperty("nextSequence", replaySequence)
+            File(cloneDir, "session-state.json").writeText(
+                liveState.toString(), StandardCharsets.UTF_8,
+            )
+            File(liveDir, "device-key.wrap.json").copyTo(
+                File(cloneDir, "device-key.wrap.json"),
+            )
+            val context = object : ContextWrapper(target) {
+                override fun getApplicationContext(): Context = this
+                override fun getNoBackupFilesDir(): File = root
+            }
+            val isolated = ClientHubSession(context)
+            try {
+                isolated.rpc("status.snapshot", JsonObject(), "android-replay-${UUID.randomUUID()}")
+                fail("Real Hub accepted a new ciphertext using an old sequence")
+            } catch (error: HubSessionException) {
+                assertEquals("HTTP_409", error.errorCode)
+            }
+            val blocked = isolated.getStatus()
+            assertTrue(blocked.get("recoveryBlocked").asBoolean)
+            assertFalse(blocked.get("remoteEnabled").asBoolean)
+            assertEquals(replaySequence + 1, blocked.get("nextSequence").asLong)
+            val pendingId = blocked.get("pendingOperationId").asString
+            val packet = JsonParser.parseString(File(cloneDir, "session-state.json")
+                .readText(StandardCharsets.UTF_8)).asJsonObject
+                .getAsJsonObject("pending").get("packetJson").asString
+
+            val restored = ClientHubSession(context)
+            assertEquals(pendingId, restored.getStatus().get("pendingOperationId").asString)
+            for ((expected, action) in listOf<Pair<String, () -> Unit>>(
+                "RECOVERY_PROTOCOL_REQUIRED" to { restored.recoverPending() },
+                "PENDING_RECOVERY_REQUIRED" to {
+                    restored.rpc("status.snapshot", JsonObject())
+                },
+            )) {
+                try {
+                    action()
+                    fail("Blocked operation unexpectedly proceeded")
+                } catch (error: HubSessionException) {
+                    assertEquals(expected, error.errorCode)
+                }
+            }
+            val after = JsonParser.parseString(File(cloneDir, "session-state.json")
+                .readText(StandardCharsets.UTF_8)).asJsonObject
+            assertEquals(packet, after.getAsJsonObject("pending").get("packetJson").asString)
+            assertEquals(replaySequence + 1, after.get("nextSequence").asLong)
+            assertFalse(session.getStatus().has("pendingOperationId"))
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test fun managerReadAndRejectionMatrixAgainstDockerHub() {
+        val before = session.getStatus()
+        assertTrue("Enrolled manager session is required", before.get("remoteEnabled").asBoolean)
+        val caps = session.rpc("session.capabilities", JsonObject())
+        assertTrue(caps.get("ok").asBoolean)
+        assertEquals("manager", caps.getAsJsonObject("result").get("role").asString)
+
+        val snapshot = session.rpc("status.snapshot", JsonObject())
+        assertTrue(snapshot.get("ok").asBoolean)
+        assertEquals("single_owner_control_database",
+            snapshot.getAsJsonObject("result").get("scope_mode").asString)
+        val changes = session.rpc("status.changes", JsonObject().apply {
+            addProperty("limit", 50)
+        })
+        assertTrue(changes.get("ok").asBoolean)
+        assertEquals("partial", changes.getAsJsonObject("result")
+            .get("completeness").asString)
+        assertTrue(session.rpc("topology.snapshot", JsonObject())
+            .getAsJsonObject("result").get("groups").isJsonArray)
+        assertTrue(session.rpc("nodes.list", JsonObject())
+            .get("result").isJsonArray)
+        assertTrue(session.rpc("approvals.list", JsonObject().apply {
+            addProperty("pending_only", true)
+        }).get("result").isJsonArray)
+        assertTrue(session.rpc("devices.list", JsonObject())
+            .get("result").isJsonArray)
+        assertTrue(session.rpc("intent.list", JsonObject())
+            .get("result").isJsonArray)
+
+        fun rejected(operation: String, body: JsonObject) {
+            val response = session.rpc(operation, body)
+            assertFalse("$operation must be rejected as a decrypted business result",
+                response.get("ok").asBoolean)
+            assertTrue("The rejection must retain a readable reason", response.has("error"))
+        }
+        rejected("nodes.preview", JsonObject().apply {
+            addProperty("user_code", "INVALID-CODE")
+        })
+        rejected("approvals.decide", JsonObject().apply {
+            addProperty("approval_id", "missing-approval-android-matrix")
+            addProperty("decision", "accept")
+        })
+        rejected("topology.apply", JsonObject().apply {
+            addProperty("kind", "group.set_parent")
+            add("set_parent", JsonObject().apply {
+                addProperty("group_id", "gr_missing_android_matrix")
+                addProperty("expected_group_version", 1)
+            })
+        })
+        rejected("intent.get", JsonObject().apply {
+            addProperty("intent_id", "missing-intent-android-matrix")
+        })
+        for (operation in listOf("link.key_manifest", "link.key_grants", "link.key_grant",
+            "group.key_manifest", "group.key_grant", "group.key_status")) {
+            try {
+                session.rpc(operation, JsonObject())
+                fail("Unverified key operation must remain disabled: $operation")
+            } catch (error: HubSessionException) {
+                assertEquals("UNSUPPORTED_RPC_OPERATION", error.errorCode)
+            }
+        }
+        rejected("link.invite_accept", JsonObject().apply {
+            addProperty("token", "invalid-test-token")
+            addProperty("target_endpoint_id", "ep_missing_android_matrix")
+            addProperty("target_group_id", "gr_missing_android_matrix")
+        })
+    }
+
+    @Test fun insecureTransportAndUnknownRpcAreRejectedBeforeNetwork() {
+        val before = session.getStatus()
+        assertTrue(before.get("remoteEnabled").asBoolean)
+        listOf("http://example.com", "http://10.0.2.2:8789").forEach { url ->
+            try {
+                session.fetchHubMetadata(url)
+                fail("Debug build accepted an unapproved HTTP Hub URL")
+            } catch (error: HubSessionException) {
+                assertEquals("INSECURE_HUB_URL", error.errorCode)
+            }
+        }
+        try {
+            session.rpc("legacy.status", JsonObject())
+            fail("Client sent an RPC outside the encrypted v2 contract")
+        } catch (error: HubSessionException) {
+            assertEquals("UNSUPPORTED_RPC_OPERATION", error.errorCode)
+        }
+        val after = session.getStatus()
+        assertEquals(before.get("hubId"), after.get("hubId"))
+        assertEquals(before.get("deviceId"), after.get("deviceId"))
+        assertEquals(before.get("nextSequence"), after.get("nextSequence"))
+        assertFalse(after.has("pendingOperationId"))
+    }
+
+    @Test fun prepareDevice() {
+        val result = session.createDeviceIdentity()
+        val publicIdentity = result.getAsJsonObject("devicePublicIdentity")
+        assertTrue(publicIdentity.get("id").asString.startsWith("pq1-"))
+        publish("device_public_identity_base64", Base64.encodeToString(
+            publicIdentity.toString().toByteArray(StandardCharsets.UTF_8), Base64.NO_WRAP,
+        ))
+    }
+
+    @Test fun enrollAndRead() {
+        val trustedHub = JsonParser.parseString(decoded("trusted_hub_identity_base64")).asJsonObject
+        val ownerPublic = decoded("owner_public_identity_base64")
+        val baseUrl = arguments.getString("hub_base_url") ?: "http://10.0.2.2:8787"
+        val expectedRole = arguments.getString("expected_role") ?: "manager"
+        val expectedScopeMode = arguments.getString("expected_scope_mode") ?: "single_owner_control_database"
+        val pin = session.pinHub(
+            baseUrl,
+            trustedHub.get("hub_id").asString,
+            trustedHub.getAsJsonObject("control_public_identity").toString(),
+        )
+        assertTrue(pin.get("pinned").asBoolean)
+        val enrolled = session.enroll(
+            argument("owner_id"),
+            argument("owner_key_id"),
+            ownerPublic,
+            argument("device_id"),
+            argument("owner_device_grant_base64"),
+        )
+        assertEquals("ACTIVE", enrolled.get("state").asString)
+        val cap = session.rpc("session.capabilities", JsonObject(), "android-capabilities-1")
+        assertTrue(cap.get("ok").asBoolean)
+        assertEquals(expectedRole, cap.getAsJsonObject("result").get("role").asString)
+        assertEquals("client-hub-v1.1", cap.getAsJsonObject("result").get("contract_revision").asString)
+        assertEquals("f6f05783ddc00e51b92ebe050b5d8e6b9b185fae80d8fc6f04bc3143b6782374",
+            cap.getAsJsonObject("result").get("catalog_sha256").asString)
+        val snapshot = session.rpc("status.snapshot", JsonObject(), "android-snapshot-2")
+        assertTrue(snapshot.get("ok").asBoolean)
+        assertEquals(expectedScopeMode,
+            snapshot.getAsJsonObject("result").get("scope_mode").asString)
+        val changes = session.rpc("status.changes", JsonObject().apply { addProperty("limit", 100) },
+            "android-changes-3")
+        assertTrue(changes.get("ok").asBoolean)
+        assertEquals("partial", changes.getAsJsonObject("result").get("completeness").asString)
+        val status = session.getStatus()
+        assertTrue(status.get("sessionCapabilitiesReady").asBoolean)
+        assertTrue(status.get("remoteEnabled").asBoolean)
+        assertFalse(status.has("pendingOperationId"))
+    }
+
+    @Test fun offlineLeavesExactPending() {
+        val operationId = "android-offline-" + java.util.UUID.randomUUID()
+        try {
+            session.rpc("status.snapshot", JsonObject(), operationId)
+            fail("Paused Hub unexpectedly accepted the request")
+        } catch (error: HubSessionException) {
+            assertEquals("NETWORK_ERROR", error.errorCode)
+        }
+        val status = session.getStatus()
+        assertEquals(operationId, status.get("pendingOperationId").asString)
+    }
+
+    @Test fun recoverAfterOnline() {
+        val before = session.getStatus()
+        val operationId = before.get("pendingOperationId").asString
+        assertTrue(operationId.startsWith("android-offline-"))
+        val result = session.recoverPending()
+        assertTrue(result.get("ok").asBoolean)
+        assertEquals(operationId, result.get("operationId").asString)
+        assertFalse(session.getStatus().has("pendingOperationId"))
+    }
+
+    @Test fun sessionIsRecoveredAfterActivityRestart() {
+        val status = session.getStatus()
+        assertFalse("Activity startup must clear only a verified pending response",
+            status.has("pendingOperationId"))
+        assertTrue(status.get("remoteEnabled").asBoolean)
+        assertEquals(arguments.getString("expected_role") ?: "manager", status.get("role").asString)
+    }
+
+    @Test fun revokedDeviceIsFenced() {
+        try {
+            session.rpc("status.snapshot", JsonObject(), "android-revoked-5")
+            fail("Revoked device unexpectedly retained RPC access")
+        } catch (error: HubSessionException) {
+            assertEquals("HTTP_403", error.errorCode)
+        }
+        assertFalse(session.getStatus().get("remoteEnabled").asBoolean)
+    }
+
+    @Test fun explicitNewDeviceAfterRevocation() {
+        val oldId = session.createDeviceIdentity()
+            .getAsJsonObject("devicePublicIdentity").get("id").asString
+        val fresh = session.startNewDeviceEnrollment()
+        val newId = fresh.getAsJsonObject("devicePublicIdentity").get("id").asString
+        assertNotEquals(oldId, newId)
+        assertTrue(fresh.get("previousDeviceMayRemainOnHub").asBoolean)
+        val status = session.getStatus()
+        assertFalse(status.get("enrolled").asBoolean)
+        assertFalse(status.get("remoteEnabled").asBoolean)
+        publish("new_device_public_identity_base64", Base64.encodeToString(
+            fresh.getAsJsonObject("devicePublicIdentity").toString()
+                .toByteArray(StandardCharsets.UTF_8), Base64.NO_WRAP,
+        ))
+    }
+
+    @Test fun managerOperationsAgainstHub() {
+        val trustedHub = JsonParser.parseString(decoded("trusted_hub_identity_base64")).asJsonObject
+        session.pinHub("http://10.0.2.2:8787", trustedHub.get("hub_id").asString,
+            trustedHub.getAsJsonObject("control_public_identity").toString())
+        assertEquals("ACTIVE", session.enroll(
+            argument("owner_id"), argument("owner_key_id"),
+            decoded("owner_public_identity_base64"), argument("device_id"),
+            argument("owner_device_grant_base64"),
+        ).get("state").asString)
+        val capabilities = session.rpc("session.capabilities", JsonObject(), "android-manager-caps")
+        assertTrue(capabilities.get("ok").asBoolean)
+        assertEquals("manager", capabilities.getAsJsonObject("result").get("role").asString)
+
+        assertTrue(session.rpc("topology.snapshot", JsonObject()).get("ok").asBoolean)
+        val groupName = "android-interop-" + System.currentTimeMillis()
+        val create = session.rpc("topology.apply", JsonObject().apply {
+            addProperty("kind", "group.create")
+            add("create_group", JsonObject().apply {
+                add("group", JsonObject().apply { addProperty("name", groupName) })
+            })
+        })
+        assertTrue(create.get("ok").asBoolean)
+        val groupId = create.getAsJsonObject("result").getAsJsonObject("group")
+            .get("group_id").asString
+        val conflict = session.rpc("topology.apply", JsonObject().apply {
+            addProperty("kind", "group.set_parent")
+            add("set_parent", JsonObject().apply {
+                addProperty("group_id", groupId)
+                addProperty("expected_group_version", 999)
+            })
+        })
+        assertFalse("Version conflict must be a decrypted business rejection",
+            conflict.get("ok").asBoolean)
+        assertTrue(session.rpc("topology.snapshot", JsonObject()).get("ok").asBoolean)
+
+        val preview = session.rpc("nodes.preview", JsonObject().apply {
+            addProperty("user_code", argument("node_user_code"))
+        })
+        assertTrue(preview.get("ok").asBoolean)
+        val binding = session.rpc("nodes.confirm", JsonObject().apply {
+            addProperty("user_code", argument("node_user_code"))
+        })
+        assertTrue(binding.get("ok").asBoolean)
+        assertTrue(session.rpc("nodes.list", JsonObject()).get("ok").asBoolean)
+        val node = binding.getAsJsonObject("result")
+        val revoked = session.rpc("nodes.revoke", JsonObject().apply {
+            addProperty("binding_id", node.get("id").asString)
+            addProperty("expected_version", node.get("version").asLong)
+        })
+        assertTrue(revoked.get("ok").asBoolean)
+
+        assertTrue(session.rpc("approvals.list", JsonObject().apply {
+            addProperty("pending_only", true)
+        }).get("ok").asBoolean)
+        val approvalRejected = session.rpc("approvals.decide", JsonObject().apply {
+            addProperty("approval_id", "nonexistent-interop-approval")
+            addProperty("decision", "accept")
+        })
+        assertFalse(approvalRejected.get("ok").asBoolean)
+
+        val intent = session.rpc("intent.submit", JsonObject().apply {
+            addProperty("text", "请概述当前已登记节点的状态")
+        })
+        assertTrue(intent.get("ok").asBoolean)
+        val intentId = intent.getAsJsonObject("result").get("id").asString
+        val intentStatus = session.rpc("intent.status", JsonObject().apply {
+            addProperty("intent_id", intentId)
+        })
+        assertTrue(intentStatus.get("ok").asBoolean)
+        assertTrue(intentStatus.getAsJsonObject("result").has("intent"))
+        assertTrue(session.rpc("status.snapshot", JsonObject()).get("ok").asBoolean)
+    }
+
+    @Test fun intentHistorySurvivesClientReload() {
+        val before = session.getStatus()
+        assertTrue("A previously enrolled manager device is required", before.get("remoteEnabled").asBoolean)
+        assertEquals("manager", before.get("role").asString)
+        val marker = "Android history interop " + System.currentTimeMillis()
+        // An unsupported kind produces needs_input without creating a Goal or modifying a workspace.
+        val submitted = session.rpc("intent.submit", JsonObject().apply {
+            addProperty("text", marker)
+            addProperty("kind", "interop_unsupported_kind")
+        })
+        assertTrue(submitted.get("ok").asBoolean)
+        val intentId = submitted.getAsJsonObject("result").get("id").asString
+
+        val reloaded = ClientHubSession(instrumentation.targetContext)
+        assertTrue(reloaded.rpc("session.capabilities", JsonObject()).get("ok").asBoolean)
+        val listed = reloaded.rpc("intent.list", JsonObject())
+        assertTrue(listed.get("ok").asBoolean)
+        val history = listed.getAsJsonArray("result")
+        assertTrue(history.any { item -> item.asJsonObject.get("id").asString == intentId &&
+            item.asJsonObject.get("text").asString == marker })
+        val detail = reloaded.rpc("intent.get", JsonObject().apply {
+            addProperty("intent_id", intentId)
+        })
+        assertTrue(detail.get("ok").asBoolean)
+        assertEquals(intentId, detail.getAsJsonObject("result").get("id").asString)
+        val progress = reloaded.rpc("intent.status", JsonObject().apply {
+            addProperty("intent_id", intentId)
+        })
+        assertTrue(progress.get("ok").asBoolean)
+        assertEquals(intentId, progress.getAsJsonObject("result")
+            .getAsJsonObject("intent").get("id").asString)
+        assertTrue(progress.getAsJsonObject("result").has("job"))
+    }
+
+    @Test fun clientDeviceListAndSelfRevokeGuard() {
+        val before = session.getStatus()
+        assertTrue("A previously enrolled manager device is required", before.get("remoteEnabled").asBoolean)
+        assertTrue(session.rpc("session.capabilities", JsonObject()).get("ok").asBoolean)
+        val ownId = before.get("deviceId").asString
+        val listed = session.rpc("devices.list", JsonObject())
+        assertTrue(listed.get("ok").asBoolean)
+        val own = listed.getAsJsonArray("result").firstOrNull { item ->
+            item.asJsonObject.get("device_id").asString == ownId
+        }?.asJsonObject ?: error("Current device missing from owner-scoped devices.list")
+        assertEquals("ACTIVE", own.get("state").asString)
+
+        val rejected = session.rpc("devices.revoke", JsonObject().apply {
+            addProperty("device_id", ownId)
+            addProperty("expected_version", own.get("version").asLong)
+        })
+        assertFalse("Server must reject self-revoke inside the encrypted RPC", rejected.get("ok").asBoolean)
+        val after = session.rpc("devices.list", JsonObject())
+        assertTrue(after.get("ok").asBoolean)
+        assertTrue(after.getAsJsonArray("result").any { item ->
+            item.asJsonObject.get("device_id").asString == ownId &&
+                item.asJsonObject.get("state").asString == "ACTIVE"
+        })
+    }
+
+    @Test fun revokeDisposablePeerDeviceWithVersionGuard() {
+        val targetId = argument("disposable_device_id")
+        require(targetId.startsWith("client-disposable-"))
+        val ownId = session.getStatus().get("deviceId").asString
+        assertNotEquals(ownId, targetId)
+        assertTrue(session.rpc("session.capabilities", JsonObject()).get("ok").asBoolean)
+        fun targetVersion(): Long {
+            val listed = session.rpc("devices.list", JsonObject())
+            assertTrue(listed.get("ok").asBoolean)
+            val target = listed.getAsJsonArray("result").firstOrNull { item ->
+                item.asJsonObject.get("device_id").asString == targetId
+            }?.asJsonObject ?: error("Disposable target absent from owner-scoped list")
+            assertEquals("ACTIVE", target.get("state").asString)
+            return target.get("version").asLong
+        }
+        val version = targetVersion()
+        val stale = session.rpc("devices.revoke", JsonObject().apply {
+            addProperty("device_id", targetId)
+            addProperty("expected_version", version + 1000)
+        })
+        assertFalse("Stale version must be a sealed business rejection", stale.get("ok").asBoolean)
+        assertEquals(version, targetVersion())
+
+        val revoked = session.rpc("devices.revoke", JsonObject().apply {
+            addProperty("device_id", targetId)
+            addProperty("expected_version", version)
+        })
+        assertTrue(revoked.get("ok").asBoolean)
+        val device = revoked.getAsJsonObject("result")
+        assertEquals("REVOKED", device.get("state").asString)
+        assertEquals(version + 1, device.get("version").asLong)
+        val finalList = session.rpc("devices.list", JsonObject())
+        assertTrue(finalList.get("ok").asBoolean)
+        assertTrue(finalList.getAsJsonArray("result").any { item ->
+            item.asJsonObject.get("device_id").asString == targetId &&
+                item.asJsonObject.get("state").asString == "REVOKED"
+        })
+    }
+
+    @Test fun confirmDisposableNodeForQueuedGoal() {
+        val nodeId = argument("disposable_node_id")
+        require(nodeId.startsWith("client-test-node-"))
+        val code = argument("node_user_code")
+        assertTrue(session.rpc("session.capabilities", JsonObject()).get("ok").asBoolean)
+        val preview = session.rpc("nodes.preview", JsonObject().apply {
+            addProperty("user_code", code)
+        })
+        assertTrue(preview.get("ok").asBoolean)
+        assertEquals(nodeId, preview.getAsJsonObject("result").get("node_id").asString)
+        val confirmed = session.rpc("nodes.confirm", JsonObject().apply {
+            addProperty("user_code", code)
+        })
+        assertTrue(confirmed.get("ok").asBoolean)
+        assertEquals(nodeId, confirmed.getAsJsonObject("result").get("node_id").asString)
+    }
+
+    @Test fun queuedGoalLifecycleAgainstDockerHub() {
+        val nodeId = argument("disposable_node_id")
+        require(nodeId.startsWith("client-test-node-"))
+        val capabilities = session.rpc("session.capabilities", JsonObject())
+        assertTrue(capabilities.get("ok").asBoolean)
+        assertEquals("manager", capabilities.getAsJsonObject("result").get("role").asString)
+        val marker = "Android queued lifecycle " + System.currentTimeMillis()
+        val accepted = session.rpc("intent.submit", JsonObject().apply {
+            addProperty("text", marker)
+            addProperty("kind", "goal")
+            add("goal", JsonObject().apply {
+                addProperty("objective", marker)
+                addProperty("success_criteria", "Return a short completion summary")
+                addProperty("constraints", "Do not modify files or contact external services")
+                addProperty("machine_id", nodeId)
+                addProperty("harness", "codex")
+            })
+        })
+        assertTrue(accepted.get("ok").asBoolean)
+        val intentId = accepted.getAsJsonObject("result").get("id").asString
+        var goalId: String? = null
+        for (attempt in 0 until 50) {
+            val progress = session.rpc("intent.status", JsonObject().apply {
+                addProperty("intent_id", intentId)
+            })
+            assertTrue(progress.get("ok").asBoolean)
+            val intent = progress.getAsJsonObject("result").getAsJsonObject("intent")
+            val result = intent.get("result")
+            if (intent.get("status").asString == "resolved" &&
+                result != null && result.isJsonObject && result.asJsonObject.has("goal_id")) {
+                goalId = result.asJsonObject.get("goal_id").asString
+                break
+            }
+            Thread.sleep(100)
+        }
+        val id = goalId ?: error("Intent did not resolve to a remote queued Goal")
+        fun goalSnapshot(): JsonObject {
+            val snapshot = session.rpc("status.snapshot", JsonObject())
+            assertTrue(snapshot.get("ok").asBoolean)
+            val body = snapshot.getAsJsonObject("result")
+            val goal = body.getAsJsonArray("goals").firstOrNull { item ->
+                item.asJsonObject.get("goal_id").asString == id
+            }?.asJsonObject ?: error("Goal missing from owner snapshot")
+            assertEquals(nodeId, goal.get("node_id").asString)
+            val workers = body.getAsJsonArray("workers")
+            assertTrue(workers.any { item ->
+                item.asJsonObject.get("goal_id")?.asString == id &&
+                    item.asJsonObject.getAsJsonObject("worker_execution")
+                        .get("state").asString == "queued"
+            })
+            return goal
+        }
+        val initial = goalSnapshot()
+        assertEquals("queued", initial.getAsJsonObject("goal_lifecycle").get("state").asString)
+        val version = initial.get("lifecycle_version").asLong
+        val paused = session.rpc("goal.lifecycle", JsonObject().apply {
+            addProperty("goal_id", id); addProperty("action", "pause")
+            addProperty("expected_version", version)
+        })
+        assertTrue(paused.get("ok").asBoolean)
+        assertEquals("paused", paused.getAsJsonObject("result").get("status").asString)
+        assertEquals(version + 1, paused.getAsJsonObject("result")
+            .get("lifecycle_version").asLong)
+        assertEquals("paused", goalSnapshot().getAsJsonObject("goal_lifecycle")
+            .get("state").asString)
+        val stale = session.rpc("goal.lifecycle", JsonObject().apply {
+            addProperty("goal_id", id); addProperty("action", "resume")
+            addProperty("expected_version", version)
+        })
+        assertFalse(stale.get("ok").asBoolean)
+        val resumed = session.rpc("goal.lifecycle", JsonObject().apply {
+            addProperty("goal_id", id); addProperty("action", "resume")
+            addProperty("expected_version", version + 1)
+        })
+        assertTrue(resumed.get("ok").asBoolean)
+        assertEquals("queued", resumed.getAsJsonObject("result").get("status").asString)
+        val finalPause = session.rpc("goal.lifecycle", JsonObject().apply {
+            addProperty("goal_id", id); addProperty("action", "pause")
+            addProperty("expected_version", version + 2)
+        })
+        assertTrue(finalPause.get("ok").asBoolean)
+        assertEquals("paused", goalSnapshot().getAsJsonObject("goal_lifecycle")
+            .get("state").asString)
+    }
+
+    @Test fun revokeDisposableNodeAfterQueuedGoal() {
+        val nodeId = argument("disposable_node_id")
+        require(nodeId.startsWith("client-test-node-"))
+        assertTrue(session.rpc("session.capabilities", JsonObject()).get("ok").asBoolean)
+        val listed = session.rpc("nodes.list", JsonObject())
+        assertTrue(listed.get("ok").asBoolean)
+        val binding = listed.getAsJsonArray("result").firstOrNull { item ->
+            item.asJsonObject.get("node_id").asString == nodeId &&
+                item.asJsonObject.get("state").asString == "ACTIVE"
+        }?.asJsonObject ?: error("Disposable Node binding absent")
+        val revoked = session.rpc("nodes.revoke", JsonObject().apply {
+            addProperty("binding_id", binding.get("id").asString)
+            addProperty("expected_version", binding.get("version").asLong)
+        })
+        assertTrue(revoked.get("ok").asBoolean)
+        assertEquals("REVOKED", revoked.getAsJsonObject("result").get("state").asString)
+    }
+}
