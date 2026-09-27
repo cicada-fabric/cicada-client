@@ -1031,7 +1031,7 @@ class ClientHubSession(context: Context) {
         if (scheme == "https") {
             if (uri.port != -1 && uri.port !in 1..65535) throw HubSessionException("INVALID_HUB_URL", "Hub HTTPS port is invalid")
         } else if (scheme == "http") {
-            if (!BuildConfig.DEBUG || host != "10.0.2.2" || uri.port !in setOf(8787, 8788, 8789, 8790, 8792)) {
+            if (!BuildConfig.DEBUG || host != "10.0.2.2" || uri.port !in setOf(8787, 8788, 8789, 8790, 8792, 8794, 8795)) {
                 throw HubSessionException("INSECURE_HUB_URL", "HTTP is allowed only from a debug build to the local emulator Hub ports")
             }
         } else {

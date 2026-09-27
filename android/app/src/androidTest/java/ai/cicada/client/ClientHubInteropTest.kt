@@ -15,6 +15,7 @@ import org.junit.Test
 import org.junit.runner.RunWith
 import java.io.File
 import java.nio.charset.StandardCharsets
+import java.security.MessageDigest
 import java.util.UUID
 
 /** Against the separately running Docker Hub, using the APK's actual Kotlin session code. */
@@ -765,6 +766,182 @@ class ClientHubInteropTest {
         assertEquals("completed", worker.get("status").asString)
         assertEquals("Node protocol fixture completed a bounded task", worker.get("summary").asString)
         assertTrue(result.get("artifacts").isJsonArray)
+    }
+
+    /** The Node Agent and Codex run separately; every user decision here is a real encrypted Android RPC. */
+    @Test fun submitBoundedRealCodexGoal() {
+        val nodeId = argument("native_node_id")
+        val marker = argument("native_marker")
+        require(nodeId.startsWith("client-test-node-") && marker.matches(Regex("CICADA_NATIVE_[A-F0-9]{16,32}")))
+        val caps = session.rpc("session.capabilities", JsonObject())
+        assertTrue(caps.get("ok").asBoolean)
+        val capability = caps.getAsJsonObject("result")
+        assertEquals("manager", capability.get("role").asString)
+        val allowed = capability.getAsJsonArray("available_rpc_operations").map { it.asString }
+        assertTrue(allowed.containsAll(listOf("intent.submit", "intent.status", "goal.result",
+            "approvals.list", "approvals.decide")))
+        val objective = "Run exactly one Codex command: printf '%s' '$marker' > " +
+            "/approval-target/result.txt. This isolated target is outside the workspace, so " +
+            "request normal approval. Do not inspect the workspace, run verification commands, " +
+            "or contact external services. After the command succeeds, reply with the marker alone."
+        val accepted = session.rpc("intent.submit", JsonObject().apply {
+            addProperty("text", objective)
+            addProperty("kind", "goal")
+            add("goal", JsonObject().apply {
+                addProperty("objective", objective)
+                addProperty("success_criteria", "The isolated marker file matches exactly")
+                addProperty("constraints", "Only write the specified isolated test file after explicit approval")
+                addProperty("machine_id", nodeId)
+                addProperty("harness", "codex")
+            })
+        })
+        assertTrue(accepted.get("ok").asBoolean)
+        val intentId = accepted.getAsJsonObject("result").get("id").asString
+        repeat(60) {
+            val progress = session.rpc("intent.status", JsonObject().apply { addProperty("intent_id", intentId) })
+            assertTrue(progress.get("ok").asBoolean)
+            val bounded = session.rpc("goal.result", JsonObject().apply { addProperty("intent_id", intentId) })
+            assertTrue(bounded.get("ok").asBoolean)
+            val result = bounded.getAsJsonObject("result")
+            val workers = result.getAsJsonArray("workers")
+            if (result.has("goal_id") && workers.size() == 1) {
+                val worker = workers.first().asJsonObject
+                assertEquals("queued", worker.get("status").asString)
+                publish("native_intent_id", intentId)
+                publish("native_goal_id", result.get("goal_id").asString)
+                publish("native_worker_id", worker.get("worker_id").asString)
+                return
+            }
+            Thread.sleep(150)
+        }
+        fail("Android Intent did not resolve to one queued Node Worker")
+    }
+
+    @Test fun recoverInterruptedReadOnlyApprovalPoll() {
+        val before = session.getStatus()
+        assertTrue("Interrupted Android polling must retain its exact packet",
+            before.has("pendingOperationId"))
+        val state = JsonParser.parseString(File(instrumentation.targetContext.noBackupFilesDir,
+            "client-hub/session-state.json").readText(StandardCharsets.UTF_8)).asJsonObject
+        assertEquals("approvals.list", state.getAsJsonObject("pending").get("operation").asString)
+        val recovered = session.recoverPending()
+        assertTrue(recovered.get("ok").asBoolean)
+        assertFalse(session.getStatus().has("pendingOperationId"))
+    }
+
+    @Test fun recoverInterruptedReadOnlyNativeQuery() {
+        val before = session.getStatus()
+        assertTrue("Interrupted Android query must retain its exact packet",
+            before.has("pendingOperationId"))
+        val state = JsonParser.parseString(File(instrumentation.targetContext.noBackupFilesDir,
+            "client-hub/session-state.json").readText(StandardCharsets.UTF_8)).asJsonObject
+        assertTrue(state.getAsJsonObject("pending").get("operation").asString in
+            setOf("approvals.list", "intent.status", "goal.result"))
+        val recovered = try {
+            session.recoverPending()
+        } catch (error: HubSessionException) {
+            if (error.errorCode != "HTTP_409_RECOVERY_REJECTED") throw error
+            // The interrupted operation is one of the read-only queries above.
+            // This is an explicit test decision to send its exact saved packet.
+            session.retryPendingExact()
+        }
+        assertTrue(recovered.get("ok").asBoolean)
+        assertFalse(session.getStatus().has("pendingOperationId"))
+    }
+
+    @Test fun approveOriginalRealCodexTurnAndReadResult() {
+        val intentId = argument("native_intent_id")
+        val goalId = argument("native_goal_id")
+        val workerId = argument("native_worker_id")
+        val marker = argument("native_marker")
+        require(marker.matches(Regex("CICADA_NATIVE_[A-F0-9]{16,32}")))
+        var nativeThreadId: String? = null
+        val decided = mutableSetOf<String>()
+        val deadline = System.currentTimeMillis() + 420_000L
+        while (System.currentTimeMillis() < deadline) {
+            val listed = session.rpc("approvals.list", JsonObject().apply { addProperty("pending_only", true) })
+            assertTrue(listed.get("ok").asBoolean)
+            for (item in listed.getAsJsonArray("result")) {
+                val approval = item.asJsonObject
+                if (approval.get("goal_id").asString != goalId ||
+                    approval.get("worker_id").asString != workerId ||
+                    approval.get("status").asString != "pending") continue
+                val approvalId = approval.get("id").asString
+                if (approvalId in decided) continue
+                assertTrue("Too many native approvals", decided.size < 6)
+                assertEquals(1, approval.get("attempt").asInt)
+                assertTrue(approval.get("method").asString in setOf(
+                    "item/commandExecution/requestApproval", "item/fileChange/requestApproval"))
+                val request = approval.getAsJsonObject("request")
+                val threadId = request.get("threadId")?.asString ?: error("Native approval omitted threadId")
+                assertTrue(threadId.isNotBlank())
+                if (nativeThreadId == null) nativeThreadId = threadId
+                assertEquals("Native approval changed Thread", nativeThreadId, threadId)
+                val requestText = request.toString()
+                assertTrue("Approval is outside the bounded target", requestText.contains("/approval-target/result.txt"))
+                val exactReadback = approval.get("method").asString ==
+                    "item/commandExecution/requestApproval" && request.get("command")?.asString ==
+                    "/bin/bash -lc 'wc -c /approval-target/result.txt && od -An -tx1c /approval-target/result.txt'"
+                assertTrue("Approval is neither the exact write nor the bounded readback",
+                    requestText.contains(marker) || exactReadback)
+                val decision = session.rpc("approvals.decide", JsonObject().apply {
+                    addProperty("approval_id", approvalId)
+                    addProperty("decision", "accept")
+                })
+                assertTrue(decision.get("ok").asBoolean)
+                assertEquals(approvalId, decision.getAsJsonObject("result").get("id").asString)
+                assertEquals("accept", decision.getAsJsonObject("result").get("decision").asString)
+                decided.add(approvalId)
+            }
+            if (decided.isNotEmpty()) {
+                val progress = session.rpc("intent.status", JsonObject().apply { addProperty("intent_id", intentId) })
+                assertTrue(progress.get("ok").asBoolean)
+                val bounded = session.rpc("goal.result", JsonObject().apply { addProperty("intent_id", intentId) })
+                assertTrue(bounded.get("ok").asBoolean)
+                val result = bounded.getAsJsonObject("result")
+                val worker = result.getAsJsonArray("workers").firstOrNull { entry ->
+                    entry.asJsonObject.get("worker_id").asString == workerId
+                }?.asJsonObject
+                if (worker != null && worker.get("status").asString == "completed") {
+                    assertEquals("DONE", progress.getAsJsonObject("result").getAsJsonObject("job")
+                        .get("state").asString)
+                    assertEquals("resolved", result.get("intent_status").asString)
+                    assertEquals(goalId, result.get("goal_id").asString)
+                    assertEquals("completed", result.get("goal_status").asString)
+                    assertEquals(1, worker.get("attempt").asInt)
+                    assertTrue(worker.get("summary").asString.isNotBlank())
+                    assertTrue(result.get("artifacts").isJsonArray)
+                    val all = session.rpc("approvals.list", JsonObject().apply {
+                        addProperty("pending_only", false)
+                    })
+                    assertTrue(all.get("ok").asBoolean)
+                    val acceptedApprovals = all.getAsJsonArray("result").map { it.asJsonObject }
+                        .filter { it.get("goal_id").asString == goalId &&
+                            it.get("worker_id").asString == workerId }
+                    assertTrue("No accepted approval belongs to this Worker", acceptedApprovals.isNotEmpty())
+                    acceptedApprovals.forEach { approved ->
+                        assertEquals(1, approved.get("attempt").asInt)
+                        assertEquals("accept", approved.get("decision").asString)
+                        assertEquals(nativeThreadId,
+                            approved.getAsJsonObject("request").get("threadId").asString)
+                    }
+                    val digest = MessageDigest.getInstance("SHA-256")
+                        .digest(nativeThreadId!!.toByteArray(StandardCharsets.UTF_8))
+                        .joinToString("") { byte -> "%02x".format(byte.toInt() and 0xff) }
+                    publish("native_thread_sha256", digest)
+                    publish("native_approval_count", acceptedApprovals.size.toString())
+                    publish("native_worker_attempt", worker.get("attempt").asString)
+                    publish("native_worker_status", worker.get("status").asString)
+                    publish("native_goal_status", result.get("goal_status").asString)
+                    publish("native_intent_status", result.get("intent_status").asString)
+                    return
+                }
+                assertFalse("Worker ended before the original turn completed", worker != null &&
+                    worker.get("status").asString in setOf("failed", "cancelled", "outcome_uncertain"))
+            }
+            Thread.sleep(1_000)
+        }
+        fail("Real Codex approval or final Worker result did not arrive before the deadline")
     }
 
     @Test fun revokeDisposableNodeAfterQueuedGoal() {

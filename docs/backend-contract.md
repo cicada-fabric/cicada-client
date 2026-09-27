@@ -1,6 +1,6 @@
-# Android Client ↔ Hub v1.2：已实现的服务端契约（2026-09-24）
+# Client ↔ Hub v1.2：已实现的服务端契约（2026-09-25）
 
-来源：核心仓库干净提交 `01d51ece186a7ec53dc2a83b77e05085f939bd28` 导出的 [固定协议包](../contracts/README.md)，并核对实际路由和测试。核心服务端是权威定义；本仓库不链接 Go 核心，也不调用旧 `/v1` 管理 bearer API。固定镜像 ID 为 `sha256:e31b4c5dc6fceb27932fbc4e5a43afac425b6ef0647a3c7f25788ff52b31585b`；本地隔离 Hub 在 `127.0.0.1:8789`，模拟器使用 `10.0.2.2:8789`；生产仅允许 HTTPS 和独立核验的 Hub 身份。历史镜像和旧验收不能证明 v1.2。
+来源：核心仓库干净提交 `41beaf0fa57e8279ad993fa4ce070a33515851ba` 导出的 [固定协议包](../contracts/README.md)，并核对实际路由和测试。核心服务端是权威定义；本仓库不链接 Go 核心，也不调用旧 `/v1` 管理 bearer API。固定镜像 ID 为 `sha256:528dc6817a35a37c1c028dce85243afb3a7e42b4b04ed9410bd68046ef7d67e8`；一次性隔离 Hub 在 `127.0.0.1:8794`，模拟器使用 `10.0.2.2:8794`；生产仅允许 HTTPS 和独立核验的 Hub 身份。历史镜像和旧验收不能证明本次固定版本。
 
 | 步骤 | 真实接口 | Android 用法与边界 |
 |---|---|---|
@@ -16,13 +16,13 @@
 | Goal 生命周期 | 加密 `goal.lifecycle` | 工作页仅在已知、非陈旧的远端 queued/paused Goal 且其 Worker 均已知为 queued 时提供 `pause/resume`；提交前重读权威快照并带 `expected_version`，失败后不自动重试。Android Kotlin 加密 RPC 已在真实 Docker Hub 的远端排队 Goal 上通过暂停、过期版本拒绝、恢复和 Node 不可领取验证；手机 UI 的恢复/暂停排队确认亦已实测。服务端不停止正在运行的原生 Worker。 |
 | 拓扑 | 加密 `topology.snapshot`、`topology.apply` | `group.create`、`group.set_parent`、`endpoint.join_group/leave_group`、`membership.bind_role`、同 owner `link.propose/revoke`；使用对象版本/绑定 epoch，失败重新读取权威状态。 |
 | Node 绑定 | 加密 `nodes.preview/confirm/list/revoke` | Node 本地保管 bearer，手机只输入短码；先预览核对再批准；撤销带 `expected_version`。 |
-| 审批 | 加密 `approvals.list/decide` | manager owner 才能列举和决定；`accept/decline` 只对 pending 生效。 |
+| 审批 | 加密 `approvals.list/decide` | manager owner 才能列举和决定；`accept/decline` 只对 pending 生效。固定镜像上的 Android 模拟器已对真实远端 Node/Codex 原生审批作出决定，并核对同一 Worker attempt 与 Thread 摘要。 |
 | 跨 owner 提案与密钥同意 | 加密 `link.list`、`link.invite_create/preview/accept`；Hub 另广告 `link.key_*` | Android 管理页按 `external_link_invites` 与加密会话授权展示 owner-scoped 分页列表、一次性邀请、受限预览、明确接受和版本化撤销；所有状态均标为提案。隔离真实 Docker Hub 与两台新 Android 模拟器已通过双 Owner 的邀请→预览→接受→双方列表→版本冲突拒绝→撤销主路径；非法 token、跨 Owner source 和消费后重放亦被拒绝。`external_thread_links=false`，只展示提案。`link.key_*` 和 `group.key_*` 在 Android 原生 RPC allowlist 中禁用，直到 Client 独立校验完整合同、manifest 和 Endpoint attestation。 |
 | Group Endpoint 密钥 | 加密 `group.key_manifest/grant/status` | Hub v1.2 返回完整 `candidate_attestation`，但固定文档与 Go 签名字节不一致；Client 的可调用 allowlist 仍不包含这三项，owner 签署入口关闭。见[接口请求](hub-interface-requests-v12.md)。 |
 
 **身份区分：** Hub 文档中的 `control_public_identity.id` 是 Client→Control 加密接收方，不是 Manager Owner ID。实际开发 Hub 的 resident Owner 由 Control 自身身份决定；测试时若把接收方公钥 ID 当成 `owner_id`，加密通道仍可建立，但 `session.capabilities.role` 正确返回 `external`。界面必须只信任加密的会话能力。
 
-**版本与证据边界（2026-09-24）：** 固定提交、镜像和包的实际验证见 [v1.2 验收](client-hub-v1.2-validation.md)。核心仓库工作树可能继续前进，不能由其当前 HEAD 推断本次固定镜像。真实 Codex、真机、公网 HTTPS 结果需分别验收；本仓库不修改核心状态声明。
+**版本与证据边界（2026-09-25）：** 固定提交、镜像和包的实际验证见 [当前验收](client-hub-v1.2-41beaf0-validation.md)。核心仓库工作树可能继续前进，不能由其当前 HEAD 推断本次固定镜像。真实 Codex 已在模拟器链路验收；Android 真机与公网 HTTPS 仍需分别验收。本仓库不修改核心状态声明。
 
 ## 目前不开放为可用功能
 

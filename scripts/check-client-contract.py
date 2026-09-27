@@ -8,8 +8,8 @@ import json
 from pathlib import Path
 
 
-ROOT = Path(__file__).resolve().parent.parent / "contracts" / "client-hub-v1.2"
-SOURCE_REVISION = "01d51ece186a7ec53dc2a83b77e05085f939bd28"
+ROOT = Path(__file__).resolve().parent.parent / "contracts" / "client-hub-v1.2-41beaf0"
+SOURCE_REVISION = "41beaf0fa57e8279ad993fa4ce070a33515851ba"
 CATALOG_SHA256 = "613084ee67f75d27762ddaf59ec2e5b33ebea7383cbfcf455a50b472e756c66a"
 
 

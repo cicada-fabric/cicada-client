@@ -1,13 +1,13 @@
-# Hub v1.2 接口阻塞项
+# Hub v1.2 接口请求与完成项
 
 ## BLOCKED：Group Endpoint attestation 的签名原文不一致
 
 **固定版本**
 
-- Hub commit：`01d51ece186a7ec53dc2a83b77e05085f939bd28`
-- 协议包 SHA-256：`628910647ecca9cf1b6d72a2872e22f6b0158b421a92b6349331a1bfdb640151`
+- Hub commit：`41beaf0fa57e8279ad993fa4ce070a33515851ba`
+- 协议包 SHA-256：`e42cdca3d9f2b8719179476e2e7e87a2a9793c8c5b2a8352331928f882d18d5d`
 - catalog SHA-256：`613084ee67f75d27762ddaf59ec2e5b33ebea7383cbfcf455a50b472e756c66a`
-- Hub 镜像 ID：`sha256:e31b4c5dc6fceb27932fbc4e5a43afac425b6ef0647a3c7f25788ff52b31585b`
+- Hub 镜像 ID：`sha256:528dc6817a35a37c1c028dce85243afb3a7e42b4b04ed9410bd68046ef7d67e8`
 
 **问题**
 
@@ -47,10 +47,10 @@ Kotlin 测试向量完全一致：
 以下命令仅读取 CICADA 中固定 commit 的源码和提供的协议包：
 
 ```bash
-tar -xOzf /home/zyf/CICADA/.cicada-data/contracts/client-hub-628910647ecca9cf1b6d72a2872e22f6b0158b421a92b6349331a1bfdb640151.tar.gz docs/client-hub-wire-v1.md \
+tar -xOzf ../CICADA/.cicada-data/contracts/client-hub-e42cdca3d9f2b8719179476e2e7e87a2a9793c8c5b2a8352331928f882d18d5d.tar.gz docs/client-hub-wire-v1.md \
   | nl -ba | sed -n '148,163p'
 
-git -C /home/zyf/CICADA show 01d51ece186a7ec53dc2a83b77e05085f939bd28:cicada-go/internal/e2ee/endpoint_attestation.go \
+git -C ../CICADA show 41beaf0fa57e8279ad993fa4ce070a33515851ba:cicada-go/internal/e2ee/endpoint_attestation.go \
   | nl -ba | sed -n '23,52p'
 ```
 
@@ -85,7 +85,7 @@ func main() {
 ## 需要固定镜像上的可复现恢复故障入口
 
 **请求：**请核心团队提供只在隔离测试环境启用的确定性入口或测试驱动，使用同一
-`01d51ece...` 镜像和公开 `/v2/client/rpc/recover`，分别让真实 Android 已登记
+`41beaf0...` 镜像和公开 `/v2/client/rpc/recover`，分别让真实 Android 已登记
 设备遇到下列三个结果。入口不能要求 Android 读取 Hub 数据库、保存管理 bearer，
 也不能让生产 Hub 暴露控制故障的 API。
 
@@ -95,25 +95,19 @@ func main() {
 | 原始请求已接受、Hub 在最终响应密封前重启 | 原包 `/recover` 返回原预留响应序号的签名密文 `OUTCOME_UNCERTAIN`；Client 验签后保留业务不确定标记并读取权威状态。 |
 | 旧 schema 无预留响应序号的未确定请求 | 原包 `/recover` 返回 HTTP 409 `RECOVERY_UNAVAILABLE`；Client 不猜响应序号，不重新执行。 |
 
-**现有复现与缺口：**在固定提交的 Git 归档中运行
-`go test -count=1 ./internal/store -run 'TestClientRecovery|TestGroupEndpointKeyGrant'`
-和
-`go test -count=1 ./internal/server -run 'TestClientRPCRecovery|TestClientIntentQueuesWorkForOwnerBoundMachineAgent|TestClientGroupEndpointKeyGrant'`
-均 exit 0，证明 Go Store/HTTP 合成故障行为。隔离固定 Docker 镜像已用 Android
-验证登记 201 丢失、RPC 200 丢失、未到达 Hub 的原包显式重试、错包与撤权；
-该运行镜像没有可由 Client 合法调用的暂停/崩溃注入入口。因此上表三个场景的
-**固定镜像 Android 实测为 NOT_RUN**。请返回可复跑命令、隔离数据条件、预期
-HTTP/密文证据和完整新镜像 ID；若合同或实现修改，请同时提供新协议包与 catalog。
+**当前验证与缺口：**新固定镜像已用 Android 模拟器验证登记 201 响应丢失与
+RPC 200 响应丢失。三种 409/不确定结果仅有核心 Go 测试所覆盖的合成故障路径；
+本次未发现可在隔离运行镜像上安全、确定、可复跑地触发它们的入口。Client
+不读取或直接修改 Hub 数据库，也不要求在生产 RPC 中加入故障开关。因此上表
+三项固定镜像 Android 实测均为 **NOT_RUN**。请交付隔离测试驱动、准备与清理
+命令、预期 HTTP/密文证据，以及对应干净 Hub commit、协议包摘要和完整镜像 ID。
 
-## BLOCKED：远端 Codex Worker 审批桥
+## 已通过：远端 Node/Codex 原生审批链路
 
-**请求：**请提供真实 Node Codex Worker 在执行原任务期间提出审批、等待同一
-Goal/Worker/attempt 的 `approvals.decide`，再继续执行并回报结果的后端通道及
-隔离验收步骤。必须由 Node 身份认证并 fence 旧 attempt；App 只通过加密
-`approvals.list/decide` 交互，不持有 Node bearer。
-
-**当前复现：**固定提交的 `TestClientIntentQueuesWorkForOwnerBoundMachineAgent`
-和本仓库的 Android→Hub→Node HTTP fixture→`goal.result` 路径使用合成 Node
-claim/result，不产生真实 Codex 审批回调。预期在真实 Node Worker 发起待审批
-动作时，Android `approvals.list` 能看到同一 attempt 的 pending 项，明确决议
-后该原生任务继续。当前桥接尚未完成，不能用人工 `CreateApproval` 行代替。
+`41beaf0` 固定镜像上，Android 模拟器经加密 `intent.submit` 创建 Goal；真实
+Node Agent 的 `gpt-5.6-luna` 原生 Codex turn 发出审批请求；Android 经加密
+`approvals.list/decide` 接受；同一 Worker 的 attempt 1 完成，Node 返回的原生
+Thread ID 摘要与 Android 所见审批请求的 Thread ID 摘要相同。Android 再用
+`intent.status` 与 `goal.result(intent_id)` 读取终态。脱敏证据与早期测试代理
+故障的修正过程见[当前验收](client-hub-v1.2-41beaf0-validation.md)。这项通过
+不替代 Android 真机或公网 HTTPS 验收。

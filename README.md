@@ -21,7 +21,7 @@ The encrypted business channel terminates at Control, which must process the use
 
 ## Development
 
-The fixed integration target is CICADA Hub commit `01d51ece186a7ec53dc2a83b77e05085f939bd28`, contract `client-hub-v1.2`, catalog SHA-256 `613084ee67f75d27762ddaf59ec2e5b33ebea7383cbfcf455a50b472e756c66a`, and local image ID `sha256:e31b4c5dc6fceb27932fbc4e5a43afac425b6ef0647a3c7f25788ff52b31585b`. The [imported contract](contracts/README.md) is verified against its source manifest. A mutable Docker tag or an older v1.1 test result does not establish this version.
+The fixed integration target is CICADA Hub commit `41beaf0fa57e8279ad993fa4ce070a33515851ba`, contract `client-hub-v1.2`, protocol archive SHA-256 `e42cdca3d9f2b8719179476e2e7e87a2a9793c8c5b2a8352331928f882d18d5d`, catalog SHA-256 `613084ee67f75d27762ddaf59ec2e5b33ebea7383cbfcf455a50b472e756c66a`, and local image ID `sha256:528dc6817a35a37c1c028dce85243afb3a7e42b4b04ed9410bd68046ef7d67e8`. The [imported contract](contracts/README.md) is verified against its source manifest. A mutable Docker tag or an earlier v1.2 test result does not establish this version.
 
 Build the current Android implementation with Docker:
 
@@ -36,7 +36,7 @@ The debug APK is written to `/gpu1-share/data/cicada-client/build-output/cicada-
 ```bash
 CICADA_EMULATOR_VECTOR_CHECK=1 \
 CICADA_EMULATOR_SECURITY_CHECK=1 \
-CICADA_EMULATOR_HUB_BASE_URL=http://10.0.2.2:8789 \
+CICADA_EMULATOR_HUB_BASE_URL=http://10.0.2.2:8794 \
 ./scripts/docker-emulator-check.sh
 ```
 
@@ -44,7 +44,7 @@ CICADA_EMULATOR_HUB_BASE_URL=http://10.0.2.2:8789 \
 
 - [Development constraints](AGENTS.md) and [product behavior](docs/product.md)
 - [Verified backend contract](docs/backend-contract.md) and [development plan](docs/development-plan.md)
-- [v1.2 validation matrix](docs/client-hub-v1.2-validation.md), including the exact image, commands, exits, evidence boundaries, and items not run
+- [Current fixed-image validation](docs/client-hub-v1.2-41beaf0-validation.md), including the exact image, commands, exits, evidence boundaries, and items not run
 - [Requests for the CICADA core team](docs/hub-interface-requests-v12.md) and [handoff prompt](docs/cicada-core-handoff.md)
 
-The v1.2 fixed-image Android emulator tests cover encrypted capabilities, enrollment and RPC response loss, replay and revocation, a queued Goal, and a synthetic Node protocol result. A real remote Codex Worker approval bridge, physical-device testing, and public HTTPS validation are still outstanding. The [v1.1 validation](docs/client-hub-v1.1-validation.md) is historical and is not counted for v1.2.
+The fixed-image Android emulator matrix and its precise outcome are recorded in the [current validation report](docs/client-hub-v1.2-41beaf0-validation.md). Physical-device and public HTTPS validation remain separate gates. The [earlier v1.2 report](docs/client-hub-v1.2-validation.md) and [v1.1 report](docs/client-hub-v1.1-validation.md) are historical evidence and are not counted for this Hub image.
