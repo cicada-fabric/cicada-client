@@ -102,6 +102,48 @@ class ClientHubNativeModule(context: ReactApplicationContext) : ReactContextBase
             requiredString(options, "endpointId"))
     }
 
+    @com.facebook.react.bridge.ReactMethod
+    fun getMonitorBroadcastOperations(promise: Promise) = run(promise) {
+        session.monitorBroadcastOperations()
+    }
+
+    @com.facebook.react.bridge.ReactMethod
+    fun monitorBroadcastBodyMatches(options: ReadableMap, promise: Promise) = run(promise) {
+        session.monitorBroadcastBodyMatches(
+            requiredString(options, "previewId"),
+            requiredString(options, "body"),
+        )
+    }
+
+    @com.facebook.react.bridge.ReactMethod
+    fun monitorBroadcastPrepare(options: ReadableMap, promise: Promise) = run(promise) {
+        session.monitorBroadcastPrepare(
+            requiredString(options, "groupId"),
+            requiredString(options, "monitorEndpointId"),
+            requiredString(options, "body"),
+            optionalString(options, "operationId"),
+        )
+    }
+
+    @com.facebook.react.bridge.ReactMethod
+    fun monitorBroadcastRecover(options: ReadableMap, promise: Promise) = run(promise) {
+        session.monitorBroadcastRecover(requiredString(options, "operationId"))
+    }
+
+    @com.facebook.react.bridge.ReactMethod
+    fun monitorBroadcastConfirm(options: ReadableMap, promise: Promise) = run(promise) {
+        session.monitorBroadcastConfirm(
+            requiredString(options, "previewId"),
+            requiredString(options, "body"),
+            requiredString(options, "consentDigest"),
+        )
+    }
+
+    @com.facebook.react.bridge.ReactMethod
+    fun monitorBroadcastStatus(options: ReadableMap, promise: Promise) = run(promise) {
+        session.monitorBroadcastStatus(requiredString(options, "previewId"))
+    }
+
     private fun run(promise: Promise, action: () -> JsonObject) {
         try {
             worker.execute {

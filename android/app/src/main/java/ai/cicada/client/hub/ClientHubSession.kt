@@ -8,7 +8,6 @@ import android.util.AtomicFile
 import android.util.Base64
 import com.cicadaclient.BuildConfig
 import com.google.gson.JsonArray
-import com.google.gson.JsonElement
 import com.google.gson.JsonNull
 import com.google.gson.JsonObject
 import com.google.gson.JsonParser
@@ -53,9 +52,10 @@ class ClientHubSession(context: Context) {
     companion object {
         private const val KEY_ALIAS = "ai.cicada.client.hub.device-wrap.v1"
         private val KEY_AAD = "cicada/android/client-device-key/wrap/v1\u0000".toByteArray(StandardCharsets.UTF_8)
-        private const val CONTRACT_REVISION = "client-hub-v1.2.1"
-        private const val CATALOG_SHA256 = "25c3d7f585b1811781cb46669a09e2e08ab8c58765a7b9318145cea5bbce4df9"
+        private const val CONTRACT_REVISION = "client-hub-v1.3"
+        private const val CATALOG_SHA256 = "808f9f635effc5fa845572b976c89696ea2bb86a6a9b6f326e49d1409b570377"
         private const val MAX_BODY_BYTES = 64 * 1024
+        private const val MAX_MONITOR_BODY_BYTES = 16 * 1024
         private const val MAX_PACKET_BYTES = 256 * 1024
         private const val MAX_RESPONSE_BYTES = 256 * 1024
         private const val MAX_METADATA_BYTES = 256 * 1024
@@ -69,11 +69,19 @@ class ClientHubSession(context: Context) {
             "approvals.list", "approvals.decide", "goal.result", "intent.get", "intent.status",
             "intent.list", "intent.submit", "link.list", "link.invite_create", "link.invite_preview",
             "link.invite_accept", "group.key_manifest", "group.key_grant", "group.key_status",
+            "monitor.broadcast_prepare", "monitor.broadcast_confirm", "monitor.broadcast_status",
+            "monitor.broadcast_recover",
         )
         private val MUTATING_RPC_OPERATIONS = setOf(
             "goal.lifecycle", "topology.apply", "devices.revoke", "nodes.confirm",
             "nodes.revoke", "approvals.decide", "intent.submit", "link.invite_create",
-            "link.invite_accept", "group.key_grant",
+            "link.invite_accept", "group.key_grant", "monitor.broadcast_prepare",
+            "monitor.broadcast_confirm",
+        )
+        private val MONITOR_OPERATION_STATES = setOf(
+            "PREPARE_PENDING", "PREPARE_UNCERTAIN", "PREPARED", "APPROVED",
+            "DISPATCH_AUTHORIZED", "REJECTED", "CONFIRM_PENDING", "CONFIRM_UNCERTAIN",
+            "CONFIRM_REJECTED", "RECOVERY_UNCERTAIN", "EXPIRED",
         )
 
         /** HTTP is limited to the historical emulator route or a local ADB reverse port. */
@@ -108,6 +116,8 @@ class ClientHubSession(context: Context) {
         val expectedResponseSequence: Long?,
         /** Exact serialized signed and encrypted packet; retries must send these same bytes. */
         val packetJson: String,
+        /** Original Monitor operation associated with a read-only follow-up route. */
+        val monitorOperationId: String? = null,
     )
 
     private data class EnrollmentAttempt(
@@ -117,6 +127,27 @@ class ClientHubSession(context: Context) {
         val grantSha256: String,
         /** Exact enrollment POST body, retained across a lost HTTP 201 response. */
         val requestJson: String?,
+    )
+
+    /** Durable identifiers and digests only; Monitor message text is never saved here. */
+    private data class MonitorOperation(
+        val operationId: String,
+        val groupId: String,
+        val monitorEndpointId: String,
+        val bodySha256: String,
+        var state: String,
+        var previewId: String? = null,
+        var broadcastId: String? = null,
+        var snapshotDigest: String? = null,
+        var consentDigest: String? = null,
+        var expiresAt: String? = null,
+        var grantExpiresAt: String? = null,
+        var recipientEndpointIds: List<String> = emptyList(),
+        var confirmAttempted: Boolean = false,
+        var confirmStatusReconciled: Boolean = false,
+        var confirmOperationId: String? = null,
+        var confirmSequence: Long? = null,
+        var sealedPayload: String? = null,
     )
 
     private data class State(
@@ -137,6 +168,8 @@ class ClientHubSession(context: Context) {
         var retiredPending: Pending? = null,
         var pending: Pending? = null,
         var enrollmentAttempt: EnrollmentAttempt? = null,
+        var monitorOperations: MutableMap<String, MonitorOperation> = linkedMapOf(),
+        var retiredMonitorOperationIds: MutableSet<String> = linkedSetOf(),
         var outcomeUncertainOperationId: String? = null,
         var uncertainNeedsReconciliation: Boolean = false,
     )
@@ -187,7 +220,7 @@ class ClientHubSession(context: Context) {
         val canonicalIdentity = control.toJson()
         if (old != null && (old.baseUrl != base || old.hubId != normalizedHubId ||
                 old.controlPublicIdentityJson != canonicalIdentity) &&
-            (state.pending != null || state.enrollmentAttempt != null)) {
+            (state.pending != null || state.enrollmentAttempt != null || hasUnresolvedMonitorOperation(state))) {
             if (state.enrollmentAttempt != null) {
                 throw HubSessionException("ENROLLMENT_RECOVERY_REQUIRED", "Keep the original Hub address and trust pin while device registration is unresolved")
             }
@@ -212,6 +245,8 @@ class ClientHubSession(context: Context) {
             state.outcomeUncertainOperationId = null
             state.uncertainNeedsReconciliation = false
             state.pending = null
+            state.monitorOperations.clear()
+            state.retiredMonitorOperationIds.clear()
         }
         state.pin = Pin(base, normalizedHubId, canonicalIdentity)
         writeState(state)
@@ -255,6 +290,9 @@ class ClientHubSession(context: Context) {
         if (state.pending != null) {
             throw HubSessionException("PENDING_RECOVERY_REQUIRED", "Do not replace the device key while an encrypted request is unresolved")
         }
+        if (hasUnresolvedMonitorOperation(state)) {
+            throw HubSessionException("MONITOR_RECOVERY_REQUIRED", "Resolve the original Monitor operation before replacing this device identity")
+        }
         state.previousDeviceMayRemainOnHub = state.enrollment != null || state.previousDeviceMayRemainOnHub
         if (state.pending != null) state.retiredPending = state.pending
         state.enrollment = null
@@ -272,6 +310,8 @@ class ClientHubSession(context: Context) {
         state.outcomeUncertainOperationId = null
         state.uncertainNeedsReconciliation = false
         state.pending = null
+        state.monitorOperations.clear()
+        state.retiredMonitorOperationIds.clear()
         writeState(state)
         deleteDeviceWrappingKey()
         val identity = ClientWireCrypto.Identity.generate()
@@ -396,6 +436,8 @@ class ClientHubSession(context: Context) {
             throw HubSessionException("INVALID_ENROLLMENT_RESPONSE", "Hub returned an enrollment that does not match this request")
         }
         state.enrollment = Enrollment(owner, device, epoch, keyVersion, deviceState)
+        state.monitorOperations.clear()
+        state.retiredMonitorOperationIds.clear()
         state.nextSequence = 1
         state.lastResponseSequence = 0
         state.role = null
@@ -423,6 +465,9 @@ class ClientHubSession(context: Context) {
         if (operation.startsWith("group.key_")) {
             throw HubSessionException("VERIFIED_GROUP_FLOW_REQUIRED", "Use the verified Group key consent flow")
         }
+        if (operation.startsWith("monitor.broadcast_")) {
+            throw HubSessionException("VERIFIED_MONITOR_FLOW_REQUIRED", "Use the dedicated Monitor broadcast flow")
+        }
         val state = readState()
         requireReadyForRpc(state)
         if (state.pending != null) {
@@ -430,6 +475,325 @@ class ClientHubSession(context: Context) {
         }
         validateOperation(state, operation)
         createAndSend(state, operation, body, operationId)
+    }
+
+    /** Safe Monitor operation index, suitable for restoring UI recovery after process death. */
+    fun monitorBroadcastOperations(): JsonObject = PROCESS_LOCK.withLock {
+        val state = readState()
+        JsonObject().apply {
+            add("operations", JsonArray().apply {
+                state.monitorOperations.values.forEach { operation ->
+                    add(monitorOperationSummary(operation))
+                }
+            })
+        }
+    }
+
+    /** Locally compares an in-memory draft with one stored body digest; no RPC or disk write occurs. */
+    fun monitorBroadcastBodyMatches(previewId: String, body: String): JsonObject = PROCESS_LOCK.withLock {
+        val state = readState()
+        val preview = previewId.trim().takeIf { it.isNotEmpty() }
+            ?: throw HubSessionException("INVALID_PREVIEW_ID", "Body comparison requires a preview ID")
+        val metadata = state.monitorOperations.values.firstOrNull { it.previewId == preview }
+            ?: throw HubSessionException("UNKNOWN_MONITOR_PREVIEW", "Preview ID is not in this device's verified Monitor records")
+        val digest = monitorBodyDigest(body)
+        JsonObject().apply {
+            addProperty("matches", digest == metadata.bodySha256)
+            addProperty("bodySha256", digest)
+        }
+    }
+
+    /** Starts a Monitor preview using only selectors and the exact UTF-8 digest. */
+    fun monitorBroadcastPrepare(
+        groupId: String,
+        monitorEndpointId: String,
+        body: String,
+        operationId: String? = null,
+    ): JsonObject = PROCESS_LOCK.withLock {
+        val state = readState()
+        requireReadyForRpc(state)
+        if (state.pending != null) {
+            throw HubSessionException("PENDING_RECOVERY_REQUIRED", "Recover the exact pending encrypted request before starting Monitor prepare")
+        }
+        validateOperation(state, "monitor.broadcast_prepare")
+        val group = validateMonitorSelector(groupId, "Group ID")
+        val monitor = validateMonitorSelector(monitorEndpointId, "Monitor Endpoint ID")
+        val digest = monitorBodyDigest(body)
+        val logicalId = operationId?.trim()?.takeIf { it.isNotEmpty() } ?: UUID.randomUUID().toString()
+        if (logicalId.length > 256) throw HubSessionException("INVALID_OPERATION_ID", "Monitor Prepare operation ID is too long")
+        if (logicalId in state.monitorOperations || logicalId in state.retiredMonitorOperationIds) {
+            throw HubSessionException("MONITOR_PREPARE_RECOVERY_REQUIRED", "This Monitor Prepare operation already exists; recover its original operation ID")
+        }
+        pruneMonitorOperations(state)
+        val unresolved = state.monitorOperations.values.firstOrNull {
+            it.state in setOf("PREPARE_PENDING", "PREPARE_UNCERTAIN", "RECOVERY_UNCERTAIN", "CONFIRM_PENDING", "CONFIRM_UNCERTAIN") ||
+                it.confirmAttempted && !it.confirmStatusReconciled
+        }
+        if (unresolved != null) {
+            throw HubSessionException("MONITOR_PREPARE_RECOVERY_REQUIRED", "Recover Monitor Prepare operation ${unresolved.operationId} before starting another")
+        }
+        if (state.monitorOperations.size >= 128) {
+            throw HubSessionException("MONITOR_STATE_CAPACITY", "Temporary Monitor history capacity reached; retry after older previews expire")
+        }
+        val metadata = MonitorOperation(
+            operationId = logicalId,
+            groupId = group,
+            monitorEndpointId = monitor,
+            bodySha256 = digest,
+            state = "PREPARE_PENDING",
+        )
+        state.monitorOperations[logicalId] = metadata
+        writeState(state) // Preserve the original Prepare operation ID before any network I/O.
+
+        val response = try {
+            createAndSend(state, "monitor.broadcast_prepare", JsonObject().apply {
+                addProperty("group_id", group)
+                addProperty("monitor_endpoint_id", monitor)
+                addProperty("body_sha256", digest)
+            }, logicalId, monitorOperationId = logicalId)
+        } catch (error: Exception) {
+            // Pending packet and operation metadata remain durable for exact recovery.
+            throw error
+        }
+        if (!response.get("ok").asBoolean) {
+            if (optionalString(response, "errorCode") == "OUTCOME_UNCERTAIN") {
+                metadata.state = "PREPARE_UNCERTAIN"
+                writeState(state)
+                return@withLock JsonObject().apply {
+                    addProperty("operationId", logicalId)
+                    addProperty("outcomeUncertain", true)
+                    addProperty("recoveryRequired", true)
+                    addProperty("errorCode", "OUTCOME_UNCERTAIN")
+                }
+            }
+            metadata.state = "REJECTED"
+            writeState(state)
+            return@withLock response.deepCopy().apply { addProperty("monitorOperationId", logicalId) }
+        }
+        val result = response.get("result")?.takeIf { it.isJsonObject }?.asJsonObject
+            ?: throw HubSessionException("INVALID_MONITOR_PREPARE", "Hub returned no Monitor preview")
+        val verified = verifyMonitorPrepareAllowExpired(state, metadata, result)
+        updateMonitorPreview(metadata, result, verified)
+        metadata.state = monitorResultState(result)
+        markMonitorAuthorizationExpired(metadata, verified)
+        writeState(state)
+        monitorPrepareView(metadata, verified, result, response)
+    }
+
+    /** Reconciles only the durable original Prepare operation ID. */
+    fun monitorBroadcastRecover(operationId: String): JsonObject = PROCESS_LOCK.withLock {
+        var state = readState()
+        requireReadyForRpc(state)
+        val logicalId = operationId.trim().takeIf { it.isNotEmpty() }
+            ?: throw HubSessionException("INVALID_OPERATION_ID", "Monitor recovery requires the original Prepare operation ID")
+        var metadata = state.monitorOperations[logicalId]
+            ?: throw HubSessionException("UNKNOWN_MONITOR_OPERATION", "Monitor operation ID is not in this device's recovery record")
+        if (metadata.confirmAttempted && !metadata.confirmStatusReconciled) {
+            throw HubSessionException("MONITOR_STATUS_REQUIRED", "An uncertain confirmation must be reconciled through status for the same preview")
+        }
+        if (metadata.state == "EXPIRED" && metadata.previewId != null) {
+            return@withLock JsonObject().apply {
+                addProperty("operationId", logicalId)
+                addProperty("previewId", metadata.previewId)
+                addProperty("broadcastId", metadata.broadcastId)
+                addProperty("status", "PREPARED")
+                addProperty("expiresAt", metadata.expiresAt)
+                metadata.grantExpiresAt?.let { addProperty("grantExpiresAt", it) }
+                monitorValidUntil(metadata)?.let { addProperty("validUntil", it.toString()) }
+                addProperty("recoveryResolved", true)
+                addProperty("canConfirm", false)
+                addProperty("statusAvailable", true)
+            }
+        }
+        if (metadata.state == "REJECTED") {
+            return@withLock JsonObject().apply {
+                addProperty("operationId", logicalId)
+                addProperty("state", "REJECTED")
+                addProperty("recoveryResolved", true)
+                addProperty("canConfirm", false)
+            }
+        }
+        if (state.pending != null) {
+            val pending = state.pending!!
+            if (pending.operation != "monitor.broadcast_prepare" || pending.operationId != logicalId) {
+                throw HubSessionException("PENDING_RECOVERY_REQUIRED", "Recover the exact pending encrypted request before Monitor lookup")
+            }
+            val exact = recoverPending()
+            // recoverPending reads and commits its own State instance. Reload it before
+            // touching Monitor metadata so stale sequence/pending fields cannot be restored.
+            state = readState()
+            metadata = state.monitorOperations[logicalId]
+                ?: throw HubSessionException("UNKNOWN_MONITOR_OPERATION", "Monitor recovery metadata disappeared")
+            if (exact.get("ok")?.takeIf { it.isJsonPrimitive }?.asBoolean == true) {
+                val result = exact.get("result")?.takeIf { it.isJsonObject }?.asJsonObject
+                    ?: throw HubSessionException("INVALID_MONITOR_PREPARE", "Recovered Prepare omitted its preview")
+                return@withLock acceptMonitorPreview(state, metadata, result, exact)
+            }
+            if (optionalString(exact, "errorCode") != "OUTCOME_UNCERTAIN") {
+                metadata.state = "REJECTED"
+                writeState(state)
+                return@withLock exact.deepCopy().apply { addProperty("monitorOperationId", logicalId) }
+            }
+            metadata.state = "PREPARE_UNCERTAIN"
+            writeState(state)
+        }
+        validateOperation(state, "monitor.broadcast_recover")
+        val lookup = createAndSend(state, "monitor.broadcast_recover", JsonObject().apply {
+            addProperty("operation_id", logicalId)
+        }, monitorOperationId = logicalId)
+        if (lookup.get("ok")?.takeIf { it.isJsonPrimitive }?.asBoolean != true) {
+            // An absent/unknown lookup is not permission to issue Prepare again.
+            if (optionalString(lookup, "errorCode") == "OUTCOME_UNCERTAIN") {
+                metadata.state = "RECOVERY_UNCERTAIN"
+                writeState(state)
+            }
+            return@withLock lookup.deepCopy().apply {
+                addProperty("monitorOperationId", logicalId)
+                addProperty("recoveryUnresolved", true)
+            }
+        }
+        val result = lookup.get("result")?.takeIf { it.isJsonObject }?.asJsonObject
+            ?: throw HubSessionException("INVALID_MONITOR_RECOVERY", "Hub returned no recovered Monitor preview")
+        acceptMonitorPreview(state, metadata, result, lookup)
+    }
+
+    /** Confirms a reviewed preview exactly once; the sealed and outer RPC bytes are persisted together. */
+    fun monitorBroadcastConfirm(previewId: String, body: String, consentDigest: String): JsonObject =
+        PROCESS_LOCK.withLock {
+            val state = readState()
+            requireReadyForRpc(state)
+            if (state.pending != null) {
+                throw HubSessionException("PENDING_RECOVERY_REQUIRED", "Recover the exact pending encrypted request before Monitor confirmation")
+            }
+            val preview = previewId.trim().takeIf { it.isNotEmpty() }
+                ?: throw HubSessionException("INVALID_PREVIEW_ID", "Monitor confirmation requires a preview ID")
+            val metadata = state.monitorOperations.values.firstOrNull { it.previewId == preview }
+                ?: throw HubSessionException("UNKNOWN_MONITOR_PREVIEW", "Preview ID is not in this device's verified Monitor records")
+            if (metadata.confirmAttempted) {
+                throw HubSessionException("MONITOR_CONFIRM_RECOVERY_REQUIRED", "This preview already has a durable confirmation attempt; check its status")
+            }
+            if (metadata.state != "PREPARED") {
+                throw HubSessionException("MONITOR_PREVIEW_NOT_CONFIRMABLE", "Only an unexpired PREPARED preview can be confirmed")
+            }
+            if (monitorValidUntil(metadata)?.isAfter(Instant.now()) == false) {
+                metadata.state = "EXPIRED"
+                writeState(state)
+                throw HubSessionException("MONITOR_PREVIEW_NOT_CONFIRMABLE", "Monitor preview or Group authorization has expired")
+            }
+            val digest = monitorBodyDigest(body)
+            if (digest != metadata.bodySha256) {
+                throw HubSessionException("MONITOR_BODY_CHANGED", "Message text differs from the reviewed Monitor preview")
+            }
+            if (!constantTimeHexEquals(consentDigest, metadata.consentDigest)) {
+                throw HubSessionException("MONITOR_CONSENT_CHANGED", "Consent review differs from the verified Monitor preview")
+            }
+            validateOperation(state, "monitor.broadcast_confirm")
+            val refreshed = recoverMonitorPreviewForConfirm(state, metadata)
+            preflightMonitorAuthorization(state, metadata, refreshed)
+            if (!refreshed.canConfirm) {
+                metadata.state = "EXPIRED"
+                writeState(state)
+                throw HubSessionException("MONITOR_PREVIEW_NOT_CONFIRMABLE", "Monitor preview or its Owner grant expired before confirmation")
+            }
+            val logicalId = UUID.randomUUID().toString()
+            var exactSealedPayload: String? = null
+            createAndSend(
+                state,
+                "monitor.broadcast_confirm",
+                JsonObject(),
+                logicalId,
+                monitorOperationId = metadata.operationId,
+                bodyBuilder = { device, currentEnrollment, sequence ->
+                    val sealed = try {
+                        MonitorBroadcastCrypto.sealBody(
+                            device,
+                            refreshed,
+                            currentEnrollment.deviceId,
+                            currentEnrollment.sessionEpoch,
+                            currentEnrollment.deviceKeyVersion,
+                            sequence,
+                            body,
+                        )
+                    } catch (_: Exception) {
+                        throw HubSessionException("MONITOR_SEAL_FAILED", "Could not seal the reviewed Monitor message")
+                    }
+                    exactSealedPayload = sealed
+                    JsonObject().apply {
+                        addProperty("preview_id", metadata.previewId)
+                        addProperty("snapshot_digest", metadata.snapshotDigest)
+                        addProperty("body_sha256", metadata.bodySha256)
+                        addProperty("sealed_payload", sealed)
+                    }
+                },
+                beforePersist = { operation, sequence, requestBody ->
+                    metadata.confirmAttempted = true
+                    metadata.confirmOperationId = operation
+                    metadata.confirmSequence = sequence
+                    metadata.state = "CONFIRM_PENDING"
+                    metadata.sealedPayload = exactSealedPayload
+                    if (metadata.sealedPayload.isNullOrEmpty() ||
+                        requestBody.get("sealed_payload")?.asString != metadata.sealedPayload) {
+                        throw HubSessionException("MONITOR_SEAL_FAILED", "Sealed Monitor payload was not available for durable recovery")
+                    }
+                },
+            ).let { response ->
+                if (response.get("ok")?.takeIf { it.isJsonPrimitive }?.asBoolean == true) {
+                    val result = response.get("result")?.takeIf { it.isJsonObject }?.asJsonObject
+                        ?: throw HubSessionException("INVALID_MONITOR_CONFIRM", "Hub returned no Monitor confirmation result")
+                    validateMonitorConfirmResult(metadata, result)
+                    metadata.state = monitorResultState(result)
+                    metadata.confirmStatusReconciled = true
+                    writeState(state)
+                    return@withLock response.deepCopy().apply {
+                        addProperty("previewId", metadata.previewId)
+                        addProperty("confirmed", true)
+                    }
+                }
+                if (optionalString(response, "errorCode") == "OUTCOME_UNCERTAIN") {
+                    metadata.state = "CONFIRM_UNCERTAIN"
+                    writeState(state)
+                    return@withLock JsonObject().apply {
+                        addProperty("operationId", metadata.confirmOperationId)
+                        addProperty("previewId", metadata.previewId)
+                        addProperty("outcomeUncertain", true)
+                        addProperty("statusRequired", true)
+                        addProperty("errorCode", "OUTCOME_UNCERTAIN")
+                    }
+                }
+                metadata.state = "CONFIRM_REJECTED"
+                writeState(state)
+                response.deepCopy().apply { addProperty("previewId", metadata.previewId) }
+            }
+        }
+
+    /** Reads recipient outcomes for one locally verified preview only. */
+    fun monitorBroadcastStatus(previewId: String): JsonObject = PROCESS_LOCK.withLock {
+        val state = readState()
+        requireReadyForRpc(state)
+        if (state.pending != null) {
+            throw HubSessionException("PENDING_RECOVERY_REQUIRED", "Recover the exact pending encrypted request before Monitor status")
+        }
+        val preview = previewId.trim().takeIf { it.isNotEmpty() }
+            ?: throw HubSessionException("INVALID_PREVIEW_ID", "Monitor status requires a preview ID")
+        val metadata = state.monitorOperations.values.firstOrNull { it.previewId == preview }
+            ?: throw HubSessionException("UNKNOWN_MONITOR_PREVIEW", "Preview ID is not in this device's verified Monitor records")
+        validateOperation(state, "monitor.broadcast_status")
+        val response = createAndSend(state, "monitor.broadcast_status", JsonObject().apply {
+            addProperty("preview_id", preview)
+        }, monitorOperationId = metadata.operationId)
+        if (response.get("ok")?.takeIf { it.isJsonPrimitive }?.asBoolean != true) return@withLock response
+        val result = response.get("result")?.takeIf { it.isJsonObject }?.asJsonObject
+            ?: throw HubSessionException("INVALID_MONITOR_STATUS", "Hub returned no Monitor status")
+        validateMonitorStatusResult(metadata, result)
+        metadata.state = monitorStatusDisplayState(metadata, result)
+        metadata.confirmStatusReconciled = true
+        if (metadata.confirmAttempted && state.uncertainNeedsReconciliation &&
+            state.outcomeUncertainOperationId == metadata.confirmOperationId) {
+            clearMonitorUncertainLatch(state, metadata)
+        } else {
+            writeState(state)
+        }
+        response
     }
 
     /** Returns a manifest only after independent proof and digest validation. */
@@ -678,7 +1042,16 @@ class ClientHubSession(context: Context) {
         result
     }
 
-    private fun createAndSend(state: State, operation: String, body: JsonObject, operationId: String?): JsonObject {
+    private fun createAndSend(
+        state: State,
+        operation: String,
+        body: JsonObject,
+        operationId: String? = null,
+        monitorOperationId: String? = null,
+        bodyBuilder: ((ClientWireCrypto.Identity, Enrollment, Long) -> JsonObject)? = null,
+        beforePersist: ((String, Long, JsonObject) -> Unit)? = null,
+        processMonitorResponse: Boolean = true,
+    ): JsonObject {
         val pin = state.pin ?: throw HubSessionException("HUB_NOT_PINNED", "Hub pin is missing")
         val enrollment = state.enrollment ?: throw HubSessionException("DEVICE_NOT_ENROLLED", "Device enrollment is missing")
         val device = loadDeviceIdentity()
@@ -705,7 +1078,8 @@ class ClientHubSession(context: Context) {
                 receiverKeyId = control.id
                 receiverKeyVersion = pin.controlKeyVersion
             }
-            val bodyText = body.toString()
+            val requestBody = bodyBuilder?.invoke(device, enrollment, sequence) ?: body
+            val bodyText = requestBody.toString()
             if (bodyText.toByteArray(StandardCharsets.UTF_8).size > MAX_BODY_BYTES) {
                 throw HubSessionException("REQUEST_TOO_LARGE", "Encrypted RPC body exceeds the protocol limit")
             }
@@ -718,10 +1092,12 @@ class ClientHubSession(context: Context) {
                 throw HubSessionException("REQUEST_TOO_LARGE", "Encrypted RPC packet exceeds the protocol limit")
             }
             state.nextSequence = sequence + 1
-            state.pending = Pending(operation, logicalId, sequence, state.lastResponseSequence + 1, exactPacket)
+            state.pending = Pending(operation, logicalId, sequence, state.lastResponseSequence + 1,
+                exactPacket, monitorOperationId)
+            beforePersist?.invoke(logicalId, sequence, requestBody)
             writeState(state) // Sequence and original ciphertext reach durable storage before network I/O.
             val response = sendRpcPacket(state, pin.baseUrl, exactPacket)
-            return finishResponse(state, device, control, route, response)
+            return finishResponse(state, device, control, route, response, processMonitorResponse)
         } finally {
             device.close()
         }
@@ -733,6 +1109,7 @@ class ClientHubSession(context: Context) {
         control: ClientWireCrypto.PublicIdentity,
         route: ClientWireCrypto.Route,
         packetResponse: String,
+        processMonitorResponse: Boolean = true,
     ): JsonObject {
         val opened = try {
             ClientWireCrypto.openResponse(device, control, route, packetResponse)
@@ -810,6 +1187,7 @@ class ClientHubSession(context: Context) {
             state.validatedCatalogSha256 = null
             state.sessionCapabilitiesReady = false
         }
+        if (processMonitorResponse) applyMonitorRpcResult(state, route, pending, body, operationId, ok, uncertain)
         state.lastResponseSequence = opened.route.sequence
         state.pending = null
         state.recoveryBlocked = false
@@ -831,6 +1209,85 @@ class ClientHubSession(context: Context) {
             if (uncertain) {
                 addProperty("errorCode", "OUTCOME_UNCERTAIN")
                 add("recovery", body.get("recovery"))
+            }
+        }
+    }
+
+    /** Keeps Monitor state coherent when generic exact-packet recovery completes a special route. */
+    private fun applyMonitorRpcResult(
+        state: State,
+        route: ClientWireCrypto.Route,
+        pending: Pending,
+        body: JsonObject,
+        operationId: String,
+        ok: Boolean,
+        uncertain: Boolean,
+    ) {
+        if (!route.operation.startsWith("monitor.broadcast_")) return
+        val monitorOperationId = pending.monitorOperationId
+            ?: if (route.operation == "monitor.broadcast_prepare") route.operationId
+            else throw HubSessionException("PENDING_PACKET_INVALID", "Monitor request lost its original operation reference")
+        val metadata = state.monitorOperations[monitorOperationId]
+            ?: throw HubSessionException("PENDING_PACKET_INVALID", "Monitor request has no durable operation metadata")
+        if (route.operation == "monitor.broadcast_prepare" && route.operationId != metadata.operationId) {
+            throw HubSessionException("PENDING_PACKET_INVALID", "Monitor Prepare route differs from its durable operation ID")
+        }
+        if (uncertain) {
+            metadata.state = when (route.operation) {
+                "monitor.broadcast_prepare" -> "PREPARE_UNCERTAIN"
+                "monitor.broadcast_confirm" -> "CONFIRM_UNCERTAIN"
+                "monitor.broadcast_recover" -> "RECOVERY_UNCERTAIN"
+                else -> metadata.state
+            }
+            return
+        }
+        if (!ok) {
+            when (route.operation) {
+                "monitor.broadcast_prepare" -> metadata.state = "REJECTED"
+                "monitor.broadcast_confirm" -> metadata.state = "CONFIRM_REJECTED"
+            }
+            return
+        }
+        val result = body.get("result")?.takeIf { it.isJsonObject }?.asJsonObject
+            ?: throw HubSessionException("INVALID_MONITOR_RESULT", "Authenticated Monitor response omitted its result")
+        when (route.operation) {
+            "monitor.broadcast_prepare", "monitor.broadcast_recover" -> {
+                // A final authenticated response remains final after either signed
+                // expiry. Ledger verification checks the full proof at the inferred
+                // original Prepare instant and can never authorize confirmation.
+                val verified = verifyMonitorPrepareAllowExpired(state, metadata, result)
+                updateMonitorPreview(metadata, result, verified)
+                metadata.state = monitorResultState(result)
+                markMonitorAuthorizationExpired(metadata, verified)
+                if (metadata.state in setOf("APPROVED", "DISPATCH_AUTHORIZED") && !metadata.confirmAttempted) {
+                    metadata.confirmAttempted = true
+                    metadata.confirmStatusReconciled = false
+                }
+                if (state.outcomeUncertainOperationId == metadata.operationId) {
+                    clearMonitorUncertainLatch(state, metadata, persist = false)
+                }
+                // Reading one named property keeps this helper result anchored to the
+                // verified structure and catches accidental contract drift early.
+                if (verified.previewId != metadata.previewId) {
+                    throw HubSessionException("MONITOR_PREVIEW_MISMATCH", "Verified Monitor preview ID changed")
+                }
+            }
+            "monitor.broadcast_confirm" -> {
+                if (metadata.confirmOperationId != route.operationId || metadata.confirmSequence != route.sequence ||
+                    !metadata.confirmAttempted) {
+                    throw HubSessionException("PENDING_PACKET_INVALID", "Monitor confirmation route differs from its durable seal")
+                }
+                validateMonitorConfirmResult(metadata, result)
+                metadata.state = monitorResultState(result)
+                metadata.confirmStatusReconciled = true
+            }
+            "monitor.broadcast_status" -> {
+                validateMonitorStatusResult(metadata, result)
+                metadata.state = monitorStatusDisplayState(metadata, result)
+                metadata.confirmStatusReconciled = true
+                if (state.outcomeUncertainOperationId == metadata.confirmOperationId) {
+                    clearMonitorUncertainLatch(state, metadata, persist = false)
+                }
             }
         }
     }
@@ -1004,6 +1461,588 @@ class ClientHubSession(context: Context) {
         }
     }
 
+    private fun acceptMonitorPreview(
+        state: State,
+        metadata: MonitorOperation,
+        result: JsonObject,
+        rpcResponse: JsonObject,
+    ): JsonObject {
+        val verified = verifyMonitorPrepareAllowExpired(state, metadata, result)
+        updateMonitorPreview(metadata, result, verified)
+        metadata.state = monitorResultState(result)
+        markMonitorAuthorizationExpired(metadata, verified)
+        if (metadata.state in setOf("APPROVED", "DISPATCH_AUTHORIZED")) metadata.confirmAttempted = true
+        if (state.uncertainNeedsReconciliation && state.outcomeUncertainOperationId == metadata.operationId) {
+            clearMonitorUncertainLatch(state, metadata)
+        } else {
+            writeState(state)
+        }
+        return monitorPrepareView(metadata, verified, result, rpcResponse)
+    }
+
+    private fun recoverMonitorPreviewForConfirm(
+        state: State,
+        metadata: MonitorOperation,
+    ): MonitorBroadcastCrypto.VerifiedPrepare {
+        validateOperation(state, "monitor.broadcast_recover")
+        val response = createAndSend(state, "monitor.broadcast_recover", JsonObject().apply {
+            addProperty("operation_id", metadata.operationId)
+        }, monitorOperationId = metadata.operationId)
+        if (response.get("ok")?.takeIf { it.isJsonPrimitive }?.asBoolean != true) {
+            if (optionalString(response, "errorCode") == "OUTCOME_UNCERTAIN") {
+                metadata.state = "RECOVERY_UNCERTAIN"
+                writeState(state)
+            }
+            throw HubSessionException("MONITOR_PREVIEW_REFRESH_FAILED", "Could not refresh the same Monitor preview before confirmation")
+        }
+        val result = response.get("result")?.takeIf { it.isJsonObject }?.asJsonObject
+            ?: throw HubSessionException("INVALID_MONITOR_RECOVERY", "Hub returned no recovered Monitor preview")
+        val verified = verifyMonitorPrepareAllowExpired(state, metadata, result)
+        updateMonitorPreview(metadata, result, verified)
+        metadata.state = monitorResultState(result)
+        markMonitorAuthorizationExpired(metadata, verified)
+        if (metadata.state != "PREPARED" || metadata.confirmAttempted || !verified.canConfirm) {
+            if (metadata.state == "PREPARED" && !verified.canConfirm) metadata.state = "EXPIRED"
+            writeState(state)
+            throw HubSessionException("MONITOR_PREVIEW_NOT_CONFIRMABLE", "The recovered Monitor preview is no longer available for confirmation")
+        }
+        metadata.state = "PREPARED"
+        writeState(state)
+        return verified
+    }
+
+    /**
+     * Refreshes the current source authorization after the same-preview recovery
+     * and before any body is sealed. These reads use the current in-memory State
+     * so their authenticated sequences are not reset by a nested generic rpc().
+     */
+    private fun preflightMonitorAuthorization(
+        state: State,
+        metadata: MonitorOperation,
+        verified: MonitorBroadcastCrypto.VerifiedPrepare,
+    ) {
+        try {
+            val topology = monitorPreflightRead(state, "topology.snapshot", JsonObject())
+            verifyMonitorTopologySource(topology, state.enrollment?.ownerId
+                ?: throw IllegalArgumentException("Owner enrollment is missing"), metadata.groupId, verified.source)
+
+            val groupKeyStatus = monitorPreflightRead(state, "group.key_status", JsonObject().apply {
+                addProperty("group_id", metadata.groupId)
+                addProperty("endpoint_id", metadata.monitorEndpointId)
+            })
+            verifyCurrentMonitorGroupGrant(state, metadata, verified, groupKeyStatus)
+        } catch (error: Exception) {
+            if (error is HubSessionException && error.errorCode == "MONITOR_PREVIEW_REFRESH_FAILED") throw error
+            throw HubSessionException("MONITOR_PREVIEW_REFRESH_FAILED", "Current Group authorization changed or could not be verified")
+        }
+    }
+
+    private fun monitorPreflightRead(state: State, operation: String, body: JsonObject): JsonObject {
+        if (state.pending != null) throw HubSessionException("PENDING_RECOVERY_REQUIRED", "Recover the original request before Monitor confirmation")
+        validateOperation(state, operation)
+        val response = createAndSend(state, operation, body)
+        if (response.get("ok")?.takeIf { it.isJsonPrimitive && it.asJsonPrimitive.isBoolean }?.asBoolean != true) {
+            throw HubSessionException("MONITOR_PREVIEW_REFRESH_FAILED", "Hub could not confirm current Monitor authorization")
+        }
+        return response.get("result")?.takeIf { it.isJsonObject }?.asJsonObject
+            ?: throw HubSessionException("MONITOR_PREVIEW_REFRESH_FAILED", "Hub returned no current Monitor authorization")
+    }
+
+    /**
+     * topology.snapshot versions are management CAS versions, not the separate
+     * Group and membership revisions inside the signed Group key manifest.
+     */
+    private fun verifyMonitorTopologySource(
+        snapshot: JsonObject,
+        ownerId: String,
+        groupId: String,
+        source: MonitorBroadcastCrypto.ConsentEndpoint,
+    ) {
+        require(requiredString(snapshot, "owner_principal_id") == ownerId &&
+            longValue(snapshot, "contract_version") == 1L &&
+            requiredString(snapshot, "read_consistency") == "best_effort") {
+            "Topology snapshot scope is invalid"
+        }
+        val groups = snapshot.get("groups")?.takeIf { it.isJsonArray }?.asJsonArray
+            ?: throw IllegalArgumentException("Topology Group list is missing")
+        val group = groups.mapNotNull { it.takeIf { item -> item.isJsonObject }?.asJsonObject }
+            .filter { optionalString(it, "group_id") == groupId }
+            .singleOrNull() ?: throw IllegalArgumentException("Source Group is missing or duplicated")
+        require(requiredString(group, "state") == "ACTIVE" && longValue(group, "version") > 0) {
+            "Source Group is no longer active"
+        }
+
+        val endpoints = snapshot.get("endpoints")?.takeIf { it.isJsonArray }?.asJsonArray
+            ?: throw IllegalArgumentException("Topology Endpoint list is missing")
+        val endpoint = endpoints.mapNotNull { it.takeIf { item -> item.isJsonObject }?.asJsonObject }
+            .filter { optionalString(it, "endpoint_id") == source.endpointId }
+            .singleOrNull() ?: throw IllegalArgumentException("Source Endpoint is missing or duplicated")
+        val endpointGroups = endpoint.get("group_ids")?.takeIf { it.isJsonArray }?.asJsonArray
+            ?.mapNotNull { item -> item.takeIf { it.isJsonPrimitive }?.asString }
+            ?: throw IllegalArgumentException("Source Endpoint Group list is missing")
+        require(requiredString(endpoint, "principal_id") == source.principalId &&
+            requiredString(endpoint, "node_id") == source.nodeId &&
+            requiredString(endpoint, "binding_id") == source.bindingId &&
+            longValue(endpoint, "binding_epoch") == source.bindingEpoch &&
+            requiredString(endpoint, "binding_status") == "leased" &&
+            groupId in endpointGroups) {
+            "Source Endpoint identity or binding changed"
+        }
+
+        val memberships = snapshot.get("memberships")?.takeIf { it.isJsonArray }?.asJsonArray
+            ?: throw IllegalArgumentException("Topology membership list is missing")
+        val membership = memberships.mapNotNull { it.takeIf { item -> item.isJsonObject }?.asJsonObject }
+            .filter { optionalString(it, "group_id") == groupId &&
+                optionalString(it, "principal_id") == source.principalId }
+            .singleOrNull() ?: throw IllegalArgumentException("Source membership is missing or duplicated")
+        val roles = membership.get("roles")?.takeIf { it.isJsonArray }?.asJsonArray
+            ?.mapNotNull { item -> item.takeIf { it.isJsonPrimitive }?.asString }.orEmpty()
+        val hasMonitorRole = optionalString(membership, "role") == "monitor" || "monitor" in roles
+        require(requiredString(membership, "status") == "active" && hasMonitorRole &&
+            membership.get("broadcast_permission_enabled")
+                ?.takeIf { it.isJsonPrimitive && it.asJsonPrimitive.isBoolean }?.asBoolean == true &&
+            longValue(membership, "version") > 0) {
+            "Source Monitor membership is no longer authorized"
+        }
+    }
+
+    /** Verifies the latest CURRENT grant independently; Hub status alone is not authority. */
+    private fun verifyCurrentMonitorGroupGrant(
+        state: State,
+        metadata: MonitorOperation,
+        verified: MonitorBroadcastCrypto.VerifiedPrepare,
+        grant: JsonObject,
+    ) {
+        require(requiredString(grant, "current_status") == "CURRENT") {
+            "Source Monitor Group grant is no longer current"
+        }
+        val ownerJson = state.ownerApprovalPublicIdentityJson
+            ?: throw IllegalArgumentException("Pinned Owner approval key is missing")
+        val owner = ClientWireCrypto.PublicIdentity.parse(parseObject(ownerJson, "Saved Owner key is invalid"))
+        val manifest = grant.get("manifest")?.takeIf { it.isJsonObject }?.asJsonObject
+            ?: throw IllegalArgumentException("Current Group grant manifest is missing")
+        val currentManifest = GroupKeyManifestVerifier.verifyManifest(
+            manifest,
+            state.pin?.hubId ?: throw IllegalArgumentException("Pinned Hub identity is missing"),
+            state.enrollment?.ownerId ?: throw IllegalArgumentException("Owner enrollment is missing"),
+            metadata.groupId,
+            metadata.monitorEndpointId,
+            owner.id,
+            Instant.now(),
+        )
+        val signedProofText = requiredString(grant, "signed_proof")
+        val signedProof = decodeCanonicalBase64(signedProofText)
+        require(signedProof.isNotEmpty() && signedProof.size <= 16 * 1024) {
+            "Current Owner Group proof exceeds its protocol limit"
+        }
+        GroupKeyOwnerProof.verify(signedProof, currentManifest, owner, Instant.now())
+
+        val source = verified.source
+        val currentPublic = ClientWireCrypto.PublicIdentity.parse(
+            currentManifest.getAsJsonObject("candidate_public_identity"),
+        )
+        require(verified.hubId == state.pin?.hubId && verified.ownerId == state.enrollment?.ownerId &&
+            requiredString(currentManifest, "owner_id") == source.ownerId &&
+            requiredString(currentManifest, "group_id") == metadata.groupId &&
+            longValue(currentManifest, "group_revision") == verified.groupRevision &&
+            requiredString(currentManifest, "endpoint_id") == source.endpointId &&
+            requiredString(currentManifest, "principal_id") == source.principalId &&
+            requiredString(currentManifest, "node_id") == source.nodeId &&
+            longValue(currentManifest, "membership_revision") == source.membershipRevision &&
+            longValue(currentManifest, "endpoint_join_revision") == source.groupJoinRevision &&
+            requiredString(currentManifest, "binding_id") == source.bindingId &&
+            longValue(currentManifest, "binding_epoch") == source.bindingEpoch &&
+            requiredString(currentManifest, "candidate_key_id") == source.keyId &&
+            longValue(currentManifest, "candidate_version") == source.keyVersion &&
+            requiredString(currentManifest, "candidate_fingerprint") == source.keyFingerprint &&
+            requiredString(currentManifest, "candidate_proof_digest") == source.keyProofDigest &&
+            currentPublic.sameAs(verified.monitorPublicIdentity)) {
+            "Current Owner grant differs from the reviewed Monitor key and consent revisions"
+        }
+    }
+
+    private fun verifyMonitorPrepare(
+        state: State,
+        metadata: MonitorOperation,
+        result: JsonObject,
+    ): MonitorBroadcastCrypto.VerifiedPrepare {
+        val (trusted, owner) = monitorPrepareTrust(state, metadata)
+        return verifyMonitorPrepareAt(trusted, owner, result, Instant.now())
+    }
+
+    private fun monitorPrepareTrust(
+        state: State,
+        metadata: MonitorOperation,
+    ): Pair<MonitorBroadcastCrypto.TrustedPrepare, ClientWireCrypto.PublicIdentity> {
+        val pin = state.pin ?: throw HubSessionException("HUB_NOT_PINNED", "Hub pin is missing")
+        val enrollment = state.enrollment ?: throw HubSessionException("DEVICE_NOT_ENROLLED", "Device enrollment is missing")
+        val ownerText = state.ownerApprovalPublicIdentityJson
+            ?: throw HubSessionException("OWNER_PUBLIC_KEY_REQUIRED", "Enrollment has no trusted owner public key for Monitor consent verification")
+        val owner = try {
+            ClientWireCrypto.PublicIdentity.parse(parseObject(ownerText, "Invalid owner key"))
+        } catch (_: Exception) {
+            throw HubSessionException("OWNER_PUBLIC_KEY_REQUIRED", "Enrollment owner public key is invalid")
+        }
+        val trusted = MonitorBroadcastCrypto.TrustedPrepare(
+            pin.hubId,
+            enrollment.ownerId,
+            metadata.groupId,
+            metadata.monitorEndpointId,
+            metadata.bodySha256,
+        )
+        return trusted to owner
+    }
+
+    private fun verifyMonitorPrepareAllowExpired(
+        state: State,
+        metadata: MonitorOperation,
+        result: JsonObject,
+    ): MonitorBroadcastCrypto.VerifiedPrepare {
+        try {
+            return verifyMonitorPrepare(state, metadata, result)
+        } catch (error: HubSessionException) {
+            val (trusted, owner) = try { monitorPrepareTrust(state, metadata) } catch (_: Exception) { throw error }
+            // Ledger-only historical verification applies only after current proof
+            // expiry. It verifies the exact signed grant, owner proof and snapshot at
+            // the inferred original Prepare instant; it never enables confirmation.
+            return try {
+                MonitorBroadcastCrypto.verifyPrepareForLedger(result, trusted, owner, Instant.now())
+            } catch (_: Exception) {
+                throw error
+            }
+        }
+    }
+
+    private fun verifyMonitorPrepareAt(
+        trusted: MonitorBroadcastCrypto.TrustedPrepare,
+        owner: ClientWireCrypto.PublicIdentity,
+        result: JsonObject,
+        now: Instant,
+    ): MonitorBroadcastCrypto.VerifiedPrepare = try {
+            MonitorBroadcastCrypto.verifyPrepare(result, trusted, owner, now)
+        } catch (error: HubSessionException) {
+            throw error
+        } catch (_: Exception) {
+            throw HubSessionException("MONITOR_PREVIEW_INVALID", "Monitor preview evidence failed independent verification")
+        }
+
+    private fun updateMonitorPreview(
+        metadata: MonitorOperation,
+        result: JsonObject,
+        verified: MonitorBroadcastCrypto.VerifiedPrepare,
+    ) {
+        val previewId = requiredString(result, "preview_id")
+        val broadcastId = requiredString(result, "broadcast_id")
+        val group = requiredString(result, "group_id")
+        val monitor = requiredString(result, "monitor_endpoint_id")
+        val bodyDigest = requiredString(result, "body_sha256")
+        val snapshotDigest = requiredString(result, "snapshot_digest")
+        val expiresAt = requiredString(result, "expires_at")
+        val grantExpiresAt = verified.grantExpiresAt
+        val status = monitorResultState(result)
+        if (group != metadata.groupId || monitor != metadata.monitorEndpointId || bodyDigest != metadata.bodySha256 ||
+            !bodyDigest.matches(Regex("^[0-9a-f]{64}$")) ||
+            !snapshotDigest.matches(Regex("^[0-9a-f]{64}$")) ||
+            status !in setOf("PREPARED", "APPROVED", "DISPATCH_AUTHORIZED")) {
+            throw HubSessionException("MONITOR_PREVIEW_MISMATCH", "Recovered Monitor preview differs from this device's original request")
+        }
+        try {
+            Instant.parse(expiresAt)
+        } catch (_: Exception) {
+            throw HubSessionException("MONITOR_PREVIEW_INVALID", "Monitor preview expiry is invalid")
+        }
+        val preview = result.get("preview")?.takeIf { it.isJsonObject }?.asJsonObject
+            ?: throw HubSessionException("MONITOR_PREVIEW_INVALID", "Monitor preview omitted verified consent evidence")
+        val scope = preview.get("consent_scope")?.takeIf { it.isJsonObject }?.asJsonObject
+            ?: throw HubSessionException("MONITOR_PREVIEW_INVALID", "Monitor preview omitted consent scope")
+        if (requiredString(scope, "group_id") != metadata.groupId ||
+            requiredString(scope, "broadcast_id") != broadcastId) {
+            throw HubSessionException("MONITOR_PREVIEW_MISMATCH", "Monitor consent scope differs from its preview")
+        }
+        val consentDigest = requiredString(preview, "consent_sha256")
+        if (!consentDigest.matches(Regex("^[0-9a-f]{64}$"))) {
+            throw HubSessionException("MONITOR_PREVIEW_INVALID", "Monitor consent digest is invalid")
+        }
+        val source = scope.get("source")?.takeIf { it.isJsonObject }?.asJsonObject
+            ?: throw HubSessionException("MONITOR_PREVIEW_INVALID", "Monitor consent omitted its source Endpoint")
+        if (requiredString(source, "endpoint_id") != metadata.monitorEndpointId) {
+            throw HubSessionException("MONITOR_PREVIEW_MISMATCH", "Monitor consent source differs from the selected Endpoint")
+        }
+        val recipients = scope.getAsJsonArray("recipients")
+            ?: throw HubSessionException("MONITOR_PREVIEW_INVALID", "Monitor consent omitted its recipient snapshot")
+        if (recipients.size() > 32) throw HubSessionException("MONITOR_PREVIEW_INVALID", "Monitor recipient snapshot exceeds the protocol limit")
+        val recipientIds = recipients.map { item ->
+            if (!item.isJsonObject) throw HubSessionException("MONITOR_PREVIEW_INVALID", "Monitor recipient card is invalid")
+            requiredString(item.asJsonObject, "endpoint_id")
+        }
+        if (recipientIds.distinct().size != recipientIds.size ||
+            recipientIds != recipientIds.sorted() || metadata.monitorEndpointId in recipientIds) {
+            throw HubSessionException("MONITOR_PREVIEW_INVALID", "Monitor consent recipient ordering or source is invalid")
+        }
+        if (metadata.previewId != null && metadata.previewId != previewId ||
+            metadata.broadcastId != null && metadata.broadcastId != broadcastId ||
+            metadata.snapshotDigest != null && metadata.snapshotDigest != snapshotDigest ||
+            metadata.consentDigest != null && metadata.consentDigest != consentDigest ||
+            metadata.expiresAt != null && metadata.expiresAt != expiresAt ||
+            metadata.grantExpiresAt != null && metadata.grantExpiresAt != grantExpiresAt) {
+            throw HubSessionException("MONITOR_PREVIEW_CHANGED", "Monitor recovery returned different consent evidence")
+        }
+        metadata.previewId = previewId
+        metadata.broadcastId = broadcastId
+        metadata.snapshotDigest = snapshotDigest
+        metadata.consentDigest = consentDigest
+        metadata.expiresAt = expiresAt
+        metadata.grantExpiresAt = grantExpiresAt
+        metadata.recipientEndpointIds = recipientIds
+        if (status in setOf("APPROVED", "DISPATCH_AUTHORIZED") && !metadata.confirmAttempted) {
+            metadata.confirmAttempted = true
+            metadata.confirmStatusReconciled = false
+        }
+    }
+
+    private fun monitorPrepareView(
+        metadata: MonitorOperation,
+        verified: MonitorBroadcastCrypto.VerifiedPrepare,
+        result: JsonObject,
+        rpcResponse: JsonObject,
+    ): JsonObject {
+        if (verified.previewId != metadata.previewId || verified.broadcastId != metadata.broadcastId ||
+            verified.groupId != metadata.groupId || verified.monitorEndpointId != metadata.monitorEndpointId ||
+            verified.bodySha256 != metadata.bodySha256 || verified.snapshotDigest != metadata.snapshotDigest ||
+            verified.consentSha256 != metadata.consentDigest) {
+            throw HubSessionException("MONITOR_PREVIEW_MISMATCH", "Verified Monitor evidence differs from the saved operation")
+        }
+        val preview = result.getAsJsonObject("preview")
+        val scope = preview.getAsJsonObject("consent_scope")
+        val source = scope.getAsJsonObject("source")
+        val recipients = scope.getAsJsonArray("recipients")
+        val status = verified.status
+        val canConfirm = verified.canConfirm && !metadata.confirmAttempted
+        return JsonObject().apply {
+            addProperty("operationId", metadata.operationId)
+            addProperty("previewId", metadata.previewId)
+            addProperty("broadcastId", metadata.broadcastId)
+            addProperty("groupId", metadata.groupId)
+            addProperty("monitorEndpointId", metadata.monitorEndpointId)
+            addProperty("bodySha256", metadata.bodySha256)
+            addProperty("snapshotDigest", metadata.snapshotDigest)
+            addProperty("expiresAt", metadata.expiresAt)
+            addProperty("grantExpiresAt", verified.grantExpiresAt)
+            addProperty("validUntil", verified.validUntil.toString())
+            addProperty("status", status)
+            addProperty("groupRevision", verified.groupRevision)
+            addProperty("consentDigest", metadata.consentDigest)
+            add("consentScope", scope.deepCopy())
+            add("source", monitorConsentEndpointView(source))
+            add("recipients", JsonArray().apply {
+                recipients.forEach { item -> add(monitorConsentEndpointView(item.asJsonObject)) }
+            })
+            addProperty("monitorKeyId", verified.monitorKeyId)
+            addProperty("monitorBindingId", verified.monitorBindingId)
+            addProperty("monitorBindingEpoch", verified.monitorBindingEpoch)
+            addProperty("canConfirm", canConfirm)
+            addProperty("verified", true)
+            optionalString(rpcResponse, "requestId")?.let { addProperty("requestId", it) }
+        }
+    }
+
+    private fun monitorConsentEndpointView(endpoint: JsonObject): JsonObject = JsonObject().apply {
+        addProperty("endpointId", requiredString(endpoint, "endpoint_id"))
+        addProperty("principalId", requiredString(endpoint, "principal_id"))
+        addProperty("ownerId", requiredString(endpoint, "owner_id"))
+        addProperty("nodeId", requiredString(endpoint, "node_id"))
+        addProperty("membershipRevision", longValue(endpoint, "membership_revision"))
+        addProperty("groupJoinRevision", longValue(endpoint, "group_join_revision"))
+        addProperty("bindingId", requiredString(endpoint, "binding_id"))
+        addProperty("bindingEpoch", longValue(endpoint, "binding_epoch"))
+        addProperty("keyId", requiredString(endpoint, "key_id"))
+        addProperty("keyVersion", longValue(endpoint, "key_version"))
+        addProperty("keyFingerprint", requiredString(endpoint, "key_fingerprint"))
+        addProperty("keyProofDigest", requiredString(endpoint, "key_proof_digest"))
+    }
+
+    private fun monitorOperationSummary(operation: MonitorOperation): JsonObject = JsonObject().apply {
+        addProperty("operationId", operation.operationId)
+        addProperty("groupId", operation.groupId)
+        addProperty("monitorEndpointId", operation.monitorEndpointId)
+        addProperty("bodySha256", operation.bodySha256)
+        addProperty("state", operation.state)
+        operation.previewId?.let { addProperty("previewId", it) }
+        operation.broadcastId?.let { addProperty("broadcastId", it) }
+        operation.snapshotDigest?.let { addProperty("snapshotDigest", it) }
+        operation.consentDigest?.let { addProperty("consentDigest", it) }
+        operation.expiresAt?.let { addProperty("expiresAt", it) }
+        operation.grantExpiresAt?.let { addProperty("grantExpiresAt", it) }
+        monitorValidUntil(operation)?.let { addProperty("validUntil", it.toString()) }
+        add("recipientEndpointIds", JsonArray().apply { operation.recipientEndpointIds.forEach(::add) })
+        addProperty("confirmAttempted", operation.confirmAttempted)
+        addProperty("confirmStatusReconciled", operation.confirmStatusReconciled)
+        operation.confirmOperationId?.let { addProperty("confirmOperationId", it) }
+        operation.confirmSequence?.let { addProperty("confirmSequence", it) }
+    }
+
+    private fun monitorResultState(result: JsonObject): String = requiredString(result, "status").also {
+        if (it !in setOf("PREPARED", "APPROVED", "DISPATCH_AUTHORIZED")) {
+            throw HubSessionException("INVALID_MONITOR_RESULT", "Hub returned an unsupported Monitor status")
+        }
+    }
+
+    private fun validateMonitorConfirmResult(metadata: MonitorOperation, result: JsonObject) {
+        if (requiredString(result, "preview_id") != metadata.previewId ||
+            requiredString(result, "broadcast_id") != metadata.broadcastId ||
+            requiredString(result, "group_id") != metadata.groupId ||
+            requiredString(result, "monitor_endpoint_id") != metadata.monitorEndpointId ||
+            requiredString(result, "body_sha256") != metadata.bodySha256 ||
+            requiredString(result, "snapshot_digest") != metadata.snapshotDigest ||
+            requiredString(result, "expires_at") != metadata.expiresAt ||
+            monitorResultState(result) !in setOf("APPROVED", "DISPATCH_AUTHORIZED")) {
+            throw HubSessionException("INVALID_MONITOR_CONFIRM", "Monitor confirmation response differs from the sealed preview")
+        }
+        val expectedDigest = requiredString(result, "sealed_payload_digest")
+        val exactSealed = metadata.sealedPayload
+            ?: throw HubSessionException("MONITOR_SEAL_MISSING", "Exact sealed Monitor payload is missing from durable state")
+        val decoded = try { Base64.decode(exactSealed, Base64.NO_WRAP) } catch (_: Exception) {
+            throw HubSessionException("MONITOR_SEAL_MISSING", "Persisted Monitor ciphertext is invalid")
+        }
+        if (!expectedDigest.matches(Regex("^[0-9a-f]{64}$")) || expectedDigest != sha256Hex(decoded)) {
+            throw HubSessionException("INVALID_MONITOR_CONFIRM", "Monitor confirmation ciphertext digest does not match the saved envelope")
+        }
+    }
+
+    private fun validateMonitorStatusResult(metadata: MonitorOperation, result: JsonObject) {
+        val approvalStatus = optionalString(result, "approval_status")
+        if (requiredString(result, "preview_id") != metadata.previewId ||
+            requiredString(result, "broadcast_id") != metadata.broadcastId ||
+            requiredString(result, "group_id") != metadata.groupId ||
+            requiredString(result, "expires_at") != metadata.expiresAt ||
+            approvalStatus !in setOf("PREPARED", "APPROVED", "DISPATCH_AUTHORIZED")) {
+            throw HubSessionException("INVALID_MONITOR_STATUS", "Monitor status differs from the verified preview")
+        }
+        val recipients = result.getAsJsonArray("recipients")
+            ?: throw HubSessionException("INVALID_MONITOR_STATUS", "Monitor status omitted recipient outcomes")
+        if (recipients.size() > 32 ||
+            approvalStatus == "DISPATCH_AUTHORIZED" && recipients.size() != metadata.recipientEndpointIds.size) {
+            throw HubSessionException("INVALID_MONITOR_STATUS", "Monitor status recipient set differs from the consent snapshot")
+        }
+        val seenOrdinals = mutableSetOf<Int>()
+        recipients.forEach { item ->
+            if (!item.isJsonObject) throw HubSessionException("INVALID_MONITOR_STATUS", "Monitor recipient outcome is invalid")
+            val outcome = item.asJsonObject
+            val ordinalValue = longValue(outcome, "ordinal")
+            if (ordinalValue !in 0..31) {
+                throw HubSessionException("INVALID_MONITOR_STATUS", "Monitor status ordinal is outside the protocol limit")
+            }
+            val ordinal = ordinalValue.toInt()
+            if (ordinal !in metadata.recipientEndpointIds.indices || !seenOrdinals.add(ordinal) ||
+                requiredString(outcome, "endpoint_id") != metadata.recipientEndpointIds[ordinal] ||
+                requiredString(outcome, "state") !in setOf("PENDING", "FAILED", "UNKNOWN", "ACCEPTED")) {
+                throw HubSessionException("INVALID_MONITOR_STATUS", "Monitor status contains an outcome outside the consent snapshot")
+            }
+        }
+        if (approvalStatus == "DISPATCH_AUTHORIZED" && seenOrdinals.size != metadata.recipientEndpointIds.size) {
+            throw HubSessionException("INVALID_MONITOR_STATUS", "Dispatch-authorized Monitor status omitted a consent recipient")
+        }
+    }
+
+    /** Keep local expiry visible when Hub has not seeded a dispatch ledger. */
+    private fun monitorStatusDisplayState(metadata: MonitorOperation, result: JsonObject): String {
+        val approvalStatus = requiredString(result, "approval_status")
+        if (approvalStatus == "PREPARED") {
+            if (monitorValidUntil(metadata)?.isAfter(Instant.now()) == false) return "EXPIRED"
+        }
+        return approvalStatus
+    }
+
+    private fun monitorValidUntil(metadata: MonitorOperation): Instant? {
+        val previewExpiry = try {
+            metadata.expiresAt?.let { GroupKeyManifestVerifier.parseCanonicalUtc(it) }
+        } catch (_: Exception) { null }
+        val grantExpiry = try {
+            metadata.grantExpiresAt?.let { GroupKeyManifestVerifier.parseCanonicalUtc(it) }
+        } catch (_: Exception) { null }
+        return when {
+            previewExpiry != null && grantExpiry != null -> minOf(previewExpiry, grantExpiry)
+            previewExpiry != null -> previewExpiry
+            else -> grantExpiry
+        }
+    }
+
+    private fun markMonitorAuthorizationExpired(
+        metadata: MonitorOperation,
+        verified: MonitorBroadcastCrypto.VerifiedPrepare,
+    ) {
+        if (metadata.state == "PREPARED" && !verified.validUntil.isAfter(Instant.now())) {
+            metadata.state = "EXPIRED"
+        }
+    }
+
+    private fun validateMonitorSelector(value: String, name: String): String {
+        val normalized = value.trim()
+        if (normalized.isEmpty() || normalized.length > 256) {
+            throw HubSessionException("INVALID_MONITOR_SELECTOR", "$name is invalid")
+        }
+        return normalized
+    }
+
+    private fun monitorBodyDigest(body: String): String {
+        val bytes = try { strictUtf8(body) } catch (_: Exception) {
+            throw HubSessionException("INVALID_MONITOR_BODY", "Message text contains invalid Unicode")
+        }
+        if (bytes.size > MAX_MONITOR_BODY_BYTES) {
+            throw HubSessionException("MONITOR_BODY_TOO_LARGE", "Monitor message exceeds the 16 KiB UTF-8 limit")
+        }
+        return sha256Hex(bytes)
+    }
+
+    private fun strictUtf8(value: String): ByteArray {
+        val encoder = StandardCharsets.UTF_8.newEncoder()
+            .onMalformedInput(java.nio.charset.CodingErrorAction.REPORT)
+            .onUnmappableCharacter(java.nio.charset.CodingErrorAction.REPORT)
+        val encoded = encoder.encode(java.nio.CharBuffer.wrap(value))
+        return ByteArray(encoded.remaining()).apply { encoded.get(this) }
+    }
+
+    private fun sha256Hex(bytes: ByteArray): String = MessageDigest.getInstance("SHA-256")
+        .digest(bytes).joinToString("") { byte -> "%02x".format(byte.toInt() and 0xff) }
+
+    private fun constantTimeHexEquals(left: String, right: String?): Boolean {
+        if (right == null || !left.matches(Regex("^[0-9a-f]{64}$")) || !right.matches(Regex("^[0-9a-f]{64}$"))) return false
+        return MessageDigest.isEqual(left.toByteArray(StandardCharsets.US_ASCII), right.toByteArray(StandardCharsets.US_ASCII))
+    }
+
+    private fun clearMonitorUncertainLatch(state: State, metadata: MonitorOperation, persist: Boolean = true) {
+        val uncertainOperationId = state.outcomeUncertainOperationId
+        if (uncertainOperationId != null && (uncertainOperationId == metadata.operationId ||
+                uncertainOperationId == metadata.confirmOperationId)) {
+            state.outcomeUncertainOperationId = null
+            state.uncertainNeedsReconciliation = false
+            state.sessionError = null
+        }
+        if (persist) writeState(state)
+    }
+
+    private fun pruneMonitorOperations(state: State) {
+        val now = Instant.now()
+        val removable = state.monitorOperations.values.filter { operation ->
+            if (operation.state == "REJECTED") return@filter true
+            if (operation.state in setOf("PREPARE_PENDING", "PREPARE_UNCERTAIN", "RECOVERY_UNCERTAIN", "CONFIRM_PENDING", "CONFIRM_UNCERTAIN")) {
+                return@filter false
+            }
+            if (operation.confirmAttempted && !operation.confirmStatusReconciled) return@filter false
+            val expiry = monitorValidUntil(operation)
+            expiry != null && !now.isBefore(expiry)
+        }
+        removable.forEach { operation ->
+            state.monitorOperations.remove(operation.operationId)
+            state.retiredMonitorOperationIds.add(operation.operationId)
+        }
+    }
+
+    private fun hasUnresolvedMonitorOperation(state: State): Boolean = state.monitorOperations.values.any { operation ->
+        operation.state in setOf("PREPARE_PENDING", "PREPARE_UNCERTAIN", "RECOVERY_UNCERTAIN", "CONFIRM_PENDING", "CONFIRM_UNCERTAIN") ||
+            operation.confirmAttempted && !operation.confirmStatusReconciled
+    }
+
     private fun readState(): State {
         if (!stateFile.baseFile.exists()) return State()
         val json = try {
@@ -1047,6 +2086,7 @@ class ClientHubSession(context: Context) {
                 longValue(value, "sequence"),
                 optionalLong(value, "expectedResponseSequence"),
                 requiredString(value, "packetJson"),
+                optionalString(value, "monitorOperationId"),
             )
         }
         state.allowedOperations = json.getAsJsonArray("allowedOperations")?.mapNotNull { element ->
@@ -1059,6 +2099,7 @@ class ClientHubSession(context: Context) {
                 longValue(value, "sequence"),
                 optionalLong(value, "expectedResponseSequence"),
                 requiredString(value, "packetJson"),
+                optionalString(value, "monitorOperationId"),
             )
         }
         state.enrollmentAttempt = json.getAsJsonObject("enrollmentAttempt")?.let { value ->
@@ -1074,6 +2115,57 @@ class ClientHubSession(context: Context) {
         state.uncertainNeedsReconciliation = json.get("uncertainNeedsReconciliation")
             ?.takeIf { it.isJsonPrimitive && it.asJsonPrimitive.isBoolean }?.asBoolean
             ?: (state.outcomeUncertainOperationId != null)
+        json.getAsJsonArray("monitorOperations")?.forEach { item ->
+            if (!item.isJsonObject) {
+                throw HubSessionException("SESSION_STORAGE_INVALID", "Saved Monitor recovery metadata is invalid")
+            }
+            val value = item.asJsonObject
+            val operationId = requiredString(value, "operationId")
+            val groupId = requiredString(value, "groupId")
+            val monitorEndpointId = requiredString(value, "monitorEndpointId")
+            val bodySha256 = requiredString(value, "bodySha256")
+            val status = requiredString(value, "state")
+            if (operationId.isBlank() || operationId.length > 256 || groupId.isBlank() ||
+                monitorEndpointId.isBlank() || !bodySha256.matches(Regex("^[0-9a-f]{64}$")) ||
+                status !in MONITOR_OPERATION_STATES || operationId in state.monitorOperations) {
+                throw HubSessionException("SESSION_STORAGE_INVALID", "Saved Monitor recovery metadata is invalid")
+            }
+            val recipients = value.getAsJsonArray("recipientEndpointIds")?.map { element ->
+                if (!element.isJsonPrimitive || !element.asJsonPrimitive.isString) {
+                    throw HubSessionException("SESSION_STORAGE_INVALID", "Saved Monitor recipient snapshot is invalid")
+                }
+                element.asString
+            } ?: emptyList()
+            if (recipients.size > 32 || recipients.any { it.isBlank() } || recipients.distinct().size != recipients.size) {
+                throw HubSessionException("SESSION_STORAGE_INVALID", "Saved Monitor recipient snapshot is invalid")
+            }
+            state.monitorOperations[operationId] = MonitorOperation(
+                operationId = operationId,
+                groupId = groupId,
+                monitorEndpointId = monitorEndpointId,
+                bodySha256 = bodySha256,
+                state = status,
+                previewId = optionalString(value, "previewId"),
+                broadcastId = optionalString(value, "broadcastId"),
+                snapshotDigest = optionalString(value, "snapshotDigest"),
+                consentDigest = optionalString(value, "consentDigest"),
+                expiresAt = optionalString(value, "expiresAt"),
+                grantExpiresAt = optionalString(value, "grantExpiresAt"),
+                recipientEndpointIds = recipients,
+                confirmAttempted = value.get("confirmAttempted")?.takeIf { it.isJsonPrimitive && it.asJsonPrimitive.isBoolean }?.asBoolean ?: false,
+                confirmStatusReconciled = value.get("confirmStatusReconciled")?.takeIf { it.isJsonPrimitive && it.asJsonPrimitive.isBoolean }?.asBoolean ?: false,
+                confirmOperationId = optionalString(value, "confirmOperationId"),
+                confirmSequence = optionalLong(value, "confirmSequence"),
+                sealedPayload = optionalString(value, "sealedPayload"),
+            )
+        }
+        json.getAsJsonArray("retiredMonitorOperationIds")?.forEach { item ->
+            if (!item.isJsonPrimitive || !item.asJsonPrimitive.isString ||
+                item.asString.isBlank() || item.asString.length > 256 || item.asString in state.monitorOperations) {
+                throw HubSessionException("SESSION_STORAGE_INVALID", "Saved Monitor operation tombstone is invalid")
+            }
+            state.retiredMonitorOperationIds.add(item.asString)
+        }
         if (state.validatedContractRevision != CONTRACT_REVISION || state.validatedCatalogSha256 != CATALOG_SHA256) {
             // An app update must not reuse an authorization from an older catalog.
             state.sessionCapabilitiesReady = false
@@ -1125,6 +2217,7 @@ class ClientHubSession(context: Context) {
                 addProperty("sequence", pending.sequence)
                 pending.expectedResponseSequence?.let { addProperty("expectedResponseSequence", it) }
                 addProperty("packetJson", pending.packetJson)
+                pending.monitorOperationId?.let { addProperty("monitorOperationId", it) }
             })
         }
         json.add("allowedOperations", JsonArray().apply { state.allowedOperations.forEach(::add) })
@@ -1135,6 +2228,7 @@ class ClientHubSession(context: Context) {
                 addProperty("sequence", pending.sequence)
                 pending.expectedResponseSequence?.let { addProperty("expectedResponseSequence", it) }
                 addProperty("packetJson", pending.packetJson)
+                pending.monitorOperationId?.let { addProperty("monitorOperationId", it) }
             })
         }
         state.enrollmentAttempt?.let { attempt ->
@@ -1146,6 +2240,33 @@ class ClientHubSession(context: Context) {
                 attempt.requestJson?.let { addProperty("requestJson", it) }
             })
         }
+        json.add("retiredMonitorOperationIds", JsonArray().apply {
+            state.retiredMonitorOperationIds.forEach(::add)
+        })
+        json.add("monitorOperations", JsonArray().apply {
+            state.monitorOperations.values.forEach { operation ->
+                add(JsonObject().apply {
+                    addProperty("operationId", operation.operationId)
+                    addProperty("groupId", operation.groupId)
+                    addProperty("monitorEndpointId", operation.monitorEndpointId)
+                    addProperty("bodySha256", operation.bodySha256)
+                    addProperty("state", operation.state)
+                    operation.previewId?.let { addProperty("previewId", it) }
+                    operation.broadcastId?.let { addProperty("broadcastId", it) }
+                    operation.snapshotDigest?.let { addProperty("snapshotDigest", it) }
+                    operation.consentDigest?.let { addProperty("consentDigest", it) }
+                    operation.expiresAt?.let { addProperty("expiresAt", it) }
+                    operation.grantExpiresAt?.let { addProperty("grantExpiresAt", it) }
+                    add("recipientEndpointIds", JsonArray().apply { operation.recipientEndpointIds.forEach(::add) })
+                    addProperty("confirmAttempted", operation.confirmAttempted)
+                    addProperty("confirmStatusReconciled", operation.confirmStatusReconciled)
+                    operation.confirmOperationId?.let { addProperty("confirmOperationId", it) }
+                    operation.confirmSequence?.let { addProperty("confirmSequence", it) }
+                    // This is the exact signed ciphertext envelope, never the message body.
+                    operation.sealedPayload?.let { addProperty("sealedPayload", it) }
+                })
+            }
+        })
         val output = stateFile.startWrite()
         try {
             output.write(json.toString().toByteArray(StandardCharsets.UTF_8))

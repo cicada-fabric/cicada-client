@@ -9,6 +9,7 @@ The shared application is written in TypeScript and React Native. **Android is t
 - **Status and work:** Read authenticated snapshots and partial changes for authorized Nodes, Endpoints, Workers, Goals, Groups, and Tasks. Submit user-confirmed text or reviewed speech transcripts to Control, inspect Intent dispatch, and read bounded Goal results when the session permits it. Intent, Goal, Worker, and Artifact states remain distinct.
 - **Local speech:** Supported Vosk, Paraformer, and SenseVoice models are optional downloads. The model centre verifies, installs, selects, and removes supported models in the app's private storage. Users can always enter text without a model. Audio is not uploaded in the first phase. See [model selection](docs/model-selection.md) and [speech validation](docs/stt-validation.md).
 - **Hub management:** Authorized operations use the Hub's versioned guards and encrypted Client-Control RPC. Feature visibility requires both a locally implemented operation and permission in encrypted `session.capabilities`. The Hub remains authoritative for every write.
+- **Monitor consent:** Review an exact message and ordered recipient roster before authorizing a same-owner Group broadcast. The Client verifies the Monitor's Endpoint and Owner proofs, checks current source authorization before sealing, and reports approval separately from delivery or model consumption. See the [current fixed-image validation](docs/client-monitor-v13-25013b5-native-validation.md) for the tested scope.
 - **Recovery:** The Client persists the exact enrollment Grant request and each signed encrypted RPC packet before sending. It can recover a lost response with the original packet through `/v2/client/rpc/recover`. An uncertain business outcome remains visible until reconciled with authoritative state.
 
 ## Security boundary
@@ -17,21 +18,29 @@ Client-to-Control business RPC uses the Client-Control v1 post-quantum protocol:
 
 The Client does not use legacy `/v1` management bearer APIs, store Hub or Node bearer credentials, or read the Hub database. This encrypted channel terminates at Control so Control can process the request. It does not prove that ordinary peer messages are unreadable to the Hub. Cross-user Thread messaging remains unavailable while the server advertises `external_thread_links=false`.
 
-The fixed `client-hub-v1.2.1` contract corrects the Endpoint attestation v1 signature input to include the final `"signature":null` field and supplies a public synthetic vector. The Android verifier handles canonical Go RFC3339Nano timestamps. A disposable fixed-image run covers a real native Codex Endpoint candidate, independent external Owner signing, explicit Android confirmation, and encrypted `group.key_manifest → group.key_grant → group.key_status` with `CURRENT`, then `STALE` after the binding lease expires and `PROOF_EXPIRED` after proof expiry. The same run rejects a mutated Owner signature locally and rejects wrong Group/Endpoint status reads through encrypted Hub responses. See the [Group key acceptance report](docs/client-group-key-v1.2.1-disposable-validation.md) for exact APK hashes, limits, and evidence. Physical Android and public HTTPS remain untested.
+The Endpoint attestation v1 signature input includes the final `"signature":null` field. The Android verifier handles canonical Go RFC3339Nano timestamps. Historical v1.2.1 acceptance covers a real native Codex Endpoint, independent external Owner signing, explicit Android confirmation, and encrypted `group.key_manifest → group.key_grant → group.key_status` with `CURRENT`, then `STALE` after binding expiry and `PROOF_EXPIRED` after proof expiry. See the [Group key acceptance report](docs/client-group-key-v1.2.1-disposable-validation.md) for its exact APKs and rejection tests. Those results are not v1.3 acceptance. Physical Android and public HTTPS remain untested.
 
 ## Fixed Hub integration target
 
-Current integration and validation use one immutable target:
+The bounded run on the fixed v1.3 candidate below passed ten fresh Android integration selectors and the real native Monitor scenario. Three independently verified Endpoint grants reached `CURRENT`; the original Monitor previewed and dispatched the confirmed message once, and both original recipient Threads passed exact-body and context assertions. Android then read two ordered `ACCEPTED` outcomes. This used an emulator, two logical Nodes in one container and controlled native safe points. Full React Native screen-flow revalidation, physical Android and public HTTPS remain **NOT_RUN**.
 
 | Item | Fixed value |
 |---|---|
-| Hub source revision | `967dbd885fae9a150b3d9a77c8e4e30da1d0dd8a` |
-| Protocol | `client-hub-v1.2.1` |
-| Protocol archive SHA-256 | `7bf1e3702eadf9fc3ffd50a0e8ab1213db0844b2bf418b577b88ba239216bf8a` |
-| Catalog SHA-256 | `25c3d7f585b1811781cb46669a09e2e08ab8c58765a7b9318145cea5bbce4df9` |
-| Full local Docker image ID | `sha256:adca1c62db5747625141be4506c4f3713368260076c50876776b4dabafa6c1b7` |
+| Hub source revision | `25013b51915124fa1da25e5fd37088eadf0e3d2d` |
+| Protocol | `client-hub-v1.3` |
+| Protocol archive SHA-256 | `5ad36a7492dd7751308eef6fe22c44175079cd212411ffbef580576b7f2597ce` |
+| Catalog SHA-256 | `808f9f635effc5fa845572b976c89696ea2bb86a6a9b6f326e49d1409b570377` |
+| Full local Docker image ID | `sha256:a1cf39e4b341cda7d5f80a13b8c3272964f43e5341eadbae1b6caafb6a68a31c` |
 
-The imported protocol snapshot is in [`contracts/client-hub-v1.2.1-967dbd`](contracts/client-hub-v1.2.1-967dbd/manifest.json). Package, manifest, and image-label checks passed. An independent Android session verified encrypted `session.capabilities`. The current evidence, including the three recovery fault cases and their limits, is in the [v1.2.1 validation report](docs/client-hub-v1.2.1-967dbd-validation.md). Historical `41beaf0` results remain in the [archived v1.2 report](docs/client-hub-v1.2-41beaf0-validation.md) and do not count as v1.2.1 evidence.
+The imported snapshot is in [`contracts/client-hub-v1.3-25013b5`](contracts/client-hub-v1.3-25013b5/manifest.json). Archive contents, clean source, catalog, exact running image and encrypted capabilities were independently checked. The [current validation report](docs/client-monitor-v13-25013b5-native-validation.md) records the pinned artifacts, commands, exit codes and evidence. The [core handoff](docs/cicada-core-handoff.md) distinguishes transport acceptance from native model consumption and lists remaining work, including reopening an already reconciled Monitor operation in the product UI.
+
+Two historical `81d8f1f` runs retain separate results: the [first attempt](docs/client-monitor-v13-81d8f1f-native-validation.md) failed a recipient recall assertion; the [fresh recall attempt](docs/client-monitor-v13-81d8f1f-recall-validation.md) was blocked by native approval review before dispatch. Their passing Android checks and failed native outcomes are not transferred to the current run.
+
+The earlier [Set H protocol and UI acceptance](docs/client-hub-v1.3-be0269e-validation.md) used synthetic authorization Endpoints on Hub `be0269e`. A separate [Prepare recovery fault run](docs/client-monitor-v13-recovery-faults.md) passed all three outer RPC recovery states on that older image; its ledger-only fixture does not establish Monitor business execution. These results retain their original image and APK identities.
+
+The older [joint native Monitor attempt](docs/client-monitor-v13-native-acceptance.md) on `be0269e` stopped when the original native Session lease could not be renewed. Android setup and full-manifest verification passed, but no Group grant, positive Prepare or Confirm was submitted. The later `81d8f1f` results do not rewrite that failure.
+
+The [v1.2.1 validation report](docs/client-hub-v1.2.1-967dbd-validation.md), Group report and two-Owner report retain their original images and APKs. Their PASS results are not transferred to v1.3.
 
 ## Build and local development
 
@@ -43,14 +52,27 @@ python3 scripts/check-client-contract.py
 ./scripts/docker-build-android-test.sh
 ```
 
+The contract checker defaults to the historical `be0269e` snapshot. For a separately delivered candidate, first verify its archive SHA-256 against the trusted handoff, then supply the extracted snapshot and independent expected pins explicitly:
+
+```bash
+python3 scripts/check-client-contract.py \
+  --snapshot-dir "$VERIFIED_SNAPSHOT" \
+  --source-revision "$EXPECTED_HUB_COMMIT" \
+  --catalog-sha256 "$EXPECTED_CATALOG_SHA256"
+```
+
+Do not obtain the expected pins from the candidate manifest itself. This offline check does not replace fixed-image provenance or encrypted runtime `session.capabilities` verification. Run its public-fixture regressions in the Docker development image with `python3 scripts/test_check_client_contract.py`.
+
 `docker-build.sh` copies its APK to `/gpu1-share/data/cicada-client/build-output/cicada-client-debug.apk`. `docker-build-android-test.sh` writes the current debug and test APKs to `android/app/build/outputs/apk/debug/app-debug.apk` and `android/app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk`. Hash the artifacts used in each test run; the exported copy is not refreshed by the test-build script. A successful host or emulator build does not establish physical-device, iOS, or public HTTPS validation.
 
 ## Project documentation
 
+- [Git milestones and validation provenance](docs/git-history.md)
 - [Product behavior](docs/product.md), [development plan](docs/development-plan.md), and [model selection](docs/model-selection.md)
 - [Backend contract](docs/backend-contract.md), [Hub interface requests and completed items](docs/hub-interface-requests-v12.md), and [core team handoff](docs/cicada-core-handoff.md)
-- [Current v1.2.1 validation](docs/client-hub-v1.2.1-967dbd-validation.md) and [historical v1.2 validation against `41beaf0`](docs/client-hub-v1.2-41beaf0-validation.md)
+- [Current v1.3 candidate validation](docs/client-monitor-v13-25013b5-native-validation.md), [historical native attempt](docs/client-monitor-v13-81d8f1f-native-validation.md), [historical recall attempt](docs/client-monitor-v13-81d8f1f-recall-validation.md), and [historical Set H acceptance](docs/client-hub-v1.3-be0269e-validation.md)
+- [Historical v1.2.1 validation](docs/client-hub-v1.2.1-967dbd-validation.md) and [historical v1.2 validation against `41beaf0`](docs/client-hub-v1.2-41beaf0-validation.md)
 - [Disposable Group Endpoint key acceptance](docs/client-group-key-v1.2.1-disposable-validation.md)
 - [Two-Owner encrypted authorization acceptance](docs/client-two-owner-v1.2.1-967dbd-validation.md) — own-Group controls, cross-Owner rejection, Hub signature rejection and device revocation using explicitly synthetic Endpoints
 
-The fixed v1.2.1 image passed the emulator-based real Node/Codex approval and result flow; see the validation report for the exact APK and run evidence. Physical Android devices and public HTTPS have not been tested. Do not transfer results from earlier Hub images to this fixed target.
+The historical fixed v1.2.1 image passed the emulator-based real Node/Codex approval and result flow; see the validation report for the exact APK and run evidence. Physical Android devices and public HTTPS have not been tested. Do not transfer those results to the v1.3 target.

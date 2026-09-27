@@ -65,15 +65,15 @@ class ClientHubInteropTest {
             badSource.get("ok").asBoolean)
     }
 
-    @Test fun currentV121ExternalReadsUseEncryptedCapabilitiesAndGuardKeyRpc() {
+    @Test fun currentV13ExternalReadsUseEncryptedCapabilitiesAndGuardKeyRpc() {
         val before = session.getStatus()
         assertTrue(before.get("remoteEnabled").asBoolean)
         val cap = session.rpc("session.capabilities", JsonObject())
         assertTrue(cap.get("ok").asBoolean)
         val result = cap.getAsJsonObject("result")
         assertEquals("external", result.get("role").asString)
-        assertEquals("client-hub-v1.2.1", result.get("contract_revision").asString)
-        assertEquals("25c3d7f585b1811781cb46669a09e2e08ab8c58765a7b9318145cea5bbce4df9",
+        assertEquals("client-hub-v1.3", result.get("contract_revision").asString)
+        assertEquals("808f9f635effc5fa845572b976c89696ea2bb86a6a9b6f326e49d1409b570377",
             result.get("catalog_sha256").asString)
 
         val allowed = session.getStatus().getAsJsonArray("allowedOperations").map { it.asString }
@@ -312,8 +312,8 @@ class ClientHubInteropTest {
         val cap = session.rpc("session.capabilities", JsonObject(), "android-capabilities-1")
         assertTrue(cap.get("ok").asBoolean)
         assertEquals(expectedRole, cap.getAsJsonObject("result").get("role").asString)
-        assertEquals("client-hub-v1.2.1", cap.getAsJsonObject("result").get("contract_revision").asString)
-        assertEquals("25c3d7f585b1811781cb46669a09e2e08ab8c58765a7b9318145cea5bbce4df9",
+        assertEquals("client-hub-v1.3", cap.getAsJsonObject("result").get("contract_revision").asString)
+        assertEquals("808f9f635effc5fa845572b976c89696ea2bb86a6a9b6f326e49d1409b570377",
             cap.getAsJsonObject("result").get("catalog_sha256").asString)
         val snapshot = session.rpc("status.snapshot", JsonObject(), "android-snapshot-2")
         assertTrue(snapshot.get("ok").asBoolean)
@@ -352,9 +352,9 @@ class ClientHubInteropTest {
         assertEquals(1L, recovered.get("deviceKeyVersion").asLong)
         val cap = resumed.rpc("session.capabilities", JsonObject())
         assertTrue(cap.get("ok").asBoolean)
-        assertEquals("client-hub-v1.2.1", cap.getAsJsonObject("result")
+        assertEquals("client-hub-v1.3", cap.getAsJsonObject("result")
             .get("contract_revision").asString)
-        assertEquals("25c3d7f585b1811781cb46669a09e2e08ab8c58765a7b9318145cea5bbce4df9",
+        assertEquals("808f9f635effc5fa845572b976c89696ea2bb86a6a9b6f326e49d1409b570377",
             cap.getAsJsonObject("result").get("catalog_sha256").asString)
         assertFalse(resumed.getStatus().get("enrollmentRecoveryRequired").asBoolean)
     }

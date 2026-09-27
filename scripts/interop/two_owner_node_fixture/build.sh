@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-FIXED_COMMIT=967dbd885fae9a150b3d9a77c8e4e30da1d0dd8a
+FIXED_COMMIT=${FIXTURE_CORE_COMMIT:-967dbd885fae9a150b3d9a77c8e4e30da1d0dd8a}
+case "$FIXED_COMMIT" in
+  967dbd885fae9a150b3d9a77c8e4e30da1d0dd8a|be0269e80c41e94881d131bd4f4b233e80b6ffe6) ;;
+  *) echo "unsupported fixed fixture source" >&2; exit 2 ;;
+esac
 GO_BUILDER_IMAGE=sha256:3680233e3204827fbdc66088528ae6d4b3d034f51d03a99d454f6de034888244
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 CLIENT_ROOT=$(cd -- "$SCRIPT_DIR/../../.." && pwd)
@@ -48,7 +52,14 @@ git -C "$CORE_REPO" archive --format=tar "$FIXED_COMMIT" | tar -xf - -C "$SOURCE
 mkdir -p "$SOURCE_DIR/core/cicada-go/cmd/two-owner-node-fixture"
 install -m 600 "$SCRIPT_DIR/main.go" "$SOURCE_DIR/core/cicada-go/cmd/two-owner-node-fixture/main.go"
 
+proxy_args=()
+if [[ -n "${FIXTURE_HTTP_PROXY:-}" ]]; then
+  proxy_args=(--network host
+    -e "HTTPS_PROXY=$FIXTURE_HTTP_PROXY" -e "HTTP_PROXY=$FIXTURE_HTTP_PROXY"
+    -e NO_PROXY=localhost,127.0.0.1)
+fi
 docker run --rm \
+  "${proxy_args[@]}" \
   --user "$(id -u):$(id -g)" \
   -v "$SOURCE_DIR/core:/src:ro" \
   -v "$FIXTURE_BUILD_ROOT/bin:/out" \
@@ -59,6 +70,7 @@ docker run --rm \
   -e GOCACHE=/cache/gobuild \
   "$GO_BUILDER_IMAGE" \
   go build -mod=readonly -trimpath \
+    -ldflags "-X main.sourceCommit=$FIXED_COMMIT" \
     -o /out/two-owner-node-fixture \
     ./cmd/two-owner-node-fixture
 chmod 700 "$FIXTURE_BUILD_ROOT/bin/two-owner-node-fixture"

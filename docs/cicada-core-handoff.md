@@ -1,4 +1,414 @@
-# Handoff: CICADA Client ↔ fixed Hub `client-hub-v1.2.1`
+# Handoff: CICADA Client ↔ fixed Hub `client-hub-v1.3`
+
+**Date:** 2026-09-27
+
+**Branch:** `dev/react-native`
+
+**Implementation tested:** `9568b2ff6d4e156b70484c10b7fd5195405004b0`
+
+## Current bounded acceptance — clean Hub `25013b5`
+
+**Status: PASS for the bounded emulator/native scenario.** Ten fresh Android selectors passed, including final encrypted delivery status. The sole Core runner exited `0`; the original Monitor completed one preview and one dispatch, and both original recipient Threads passed exact-body and context assertions. This is not physical-device, public HTTPS or unattended cold-wake acceptance.
+
+| Input | Fixed value |
+|---|---|
+| Clean Hub commit | `25013b51915124fa1da25e5fd37088eadf0e3d2d` |
+| Full Hub image | `sha256:a1cf39e4b341cda7d5f80a13b8c3272964f43e5341eadbae1b6caafb6a68a31c` |
+| Protocol / wire | `client-hub-v1.3` / `1` |
+| Bundle SHA-256 | `5ad36a7492dd7751308eef6fe22c44175079cd212411ffbef580576b7f2597ce` |
+| Catalog SHA-256 | `808f9f635effc5fa845572b976c89696ea2bb86a6a9b6f326e49d1409b570377` |
+| Client checkout at run start | `b7ffa7edc9094f3f4c2819f9c7eb50aa3eca380c` |
+| Installed product source | `9568b2ff6d4e156b70484c10b7fd5195405004b0` |
+| Product APK SHA-256 | `f8c82d7091ffebb6add77c003c55a6f033ad657475b51b62b512bef5b0ed8700` |
+| Installed instrumentation source | `02cefa94bc6096f7196d1df572a22a1f64774d74` |
+| Instrumentation APK SHA-256 | `4cbc0e1ff0546b665e55136c1453334e282d19c380e26b63aa8601cd27a3f90b` |
+| Separate Core native runner source | `0d532f2e3bb57a9c82df4967044e4f40861c45a6` |
+| Native binary SHA-256 | `c992dd4ce9fdaeb6895ad827ae8e196155abba5009e2b3da1c4e5931eccd8589` |
+
+See the [fixed-image validation record](client-monitor-v13-25013b5-native-validation.md) for commands, exits and per-stage evidence. Its imported contract snapshot is `contracts/client-hub-v1.3-25013b5/`. The public wire, catalog and vectors are byte-identical to the previous snapshot; only the bundled development document changed. No product code or security check was relaxed for this run.
+
+Evidence root:
+
+```text
+/gpu1-share/data/cicada-client/monitor-v13-25013b5-review-20260927T115633Z/evidence/
+```
+
+All ten Android selectors run through `python3 scripts/interop/monitor-android.py "$E" test ai.cicada.client.hub.MonitorHubInteropTest#<method> --label <label>` and returned ADB/driver `0/0`, `OK (1 test)`. The record lists every method and command JSON. The two marked Nodes, Monitor permission, three verified Group proofs, exact body including whitespace, and ordered two-recipient roster were reviewed in instrumentation-driven Android dialogs. This does not constitute a fresh complete React Native UI acceptance.
+
+| Check | Result | Command exit / redacted evidence under the evidence root |
+|---|---|---|
+| Imported archive, clean running image and encrypted capabilities | **PASS** | Checker `0`; enrollment `0/0`; `bundle-image-import.json`, `contract-check.json`, `running-hub-provenance.redacted.json`, `native-enroll-capabilities.json` |
+| Three original native Endpoint identities and full Kotlin verification | **PASS** | Manifest selector `0/0`; scope comparison `0`; `native-ready.redacted.json`, `native-manifests.json`, `native-scope-comparison.redacted.json` |
+| External Owner signatures, explicit phone grants, three `CURRENT` statuses | **PASS** | Signer `0`; grant selector `0/0`; `owner-sign-groups.json`, `group-key-review.redacted.json`, `native-group-key-grants.json` |
+| Explicit permission and one exact Prepare/Confirm | **PASS** | Three selectors `0/0`; handoff staging `0`; `permission-review.redacted.json`, `broadcast-review.redacted.json`, `native-prepare.json`, `native-confirm.json`, `native-stage-confirmed.json` |
+| Native preview, single broadcast and both original recipients consuming the exact body in their retained contexts | **PASS** | Core `TestMCPMonitorBroadcastAndroidClientNative`: container `0`; `core-native-outcome.redacted.json`; actual Docker argv in Core `native-run.json` |
+| Strict Android final delivery-status observation | **PASS** | `readNativeDispatchStatus`: `0/0`; `native-final-status.json`, `android-final-status.redacted.json`; two ordered `ACCEPTED`, local `NODE_REPORTED`, remote `RELAY_PERSISTED` |
+| Full React Native flow, physical Android, public HTTPS | **NOT_RUN** | Outside this bounded emulator/native checkpoint |
+| Core scoped privacy scan and outcome evidence | **PASS** | Core `verify-private`: `0`; `core-native-outcome.redacted.json`; Client did not read the Hub database |
+| Owned Android emulator and reverse cleanup | **PASS** | Reverse removal and emulator stop: `0` each; `client-teardown.redacted.json` |
+| Core-owned Hub/Node fixture teardown | **NOT_RUN** | Core retained its fixture for independent audit at Client handoff; Client was explicitly instructed to leave it intact |
+
+Core evidence is under `/home/zyf/CICADA/.cicada-data/native-review-0d532f2/`. `native-run.json` records the actual Docker argv and start exit; `native-final.redacted.json` records native exit `0` and scoped scan exit `0`. The Client independently matched source/image/binary hashes, the three original identities and epochs, the original preview/broadcast and ordered roster. Its copied summary hashes operational identifiers. The Core-owned scan checked the exact synthetic body and three context markers in this fixture's Hub DB/WAL/SHM; it does not establish a universal plaintext-absence claim.
+
+The final read-only Android RPC advanced the sequence by one, left no pending request, and retained the original operation, Confirm identity and sequence, consent and ordered roster. Transport outcomes and model consumption have separate evidence. One preview and one dispatch were observed in this run, with stable child-message deduplication; this is not an exactly-once guarantee under arbitrary network failures. Existing uncertain-injection boundaries remain unchanged.
+
+The earlier `81d8f1f` failures below remain historical. Automatic model approval remained active; no bypass, replacement Thread, repeated phone approval or retry after refusal was used. Two logical Nodes shared one native container, and original Threads resumed at controlled safe points. Network M1, Group journal/discussions/regroup implementation, the separate reconciled-operation UI limitation, and further model runs remain outside this checkpoint. No product code changed, and nothing was pushed, merged or published.
+
+### Current review prompt for the CICADA maintainer
+
+```text
+Review CICADA_CLIENT read-only on dev/react-native:
+- docs/client-monitor-v13-25013b5-native-validation.md
+- docs/cicada-core-handoff.md, README.md and the local delivery commit.
+
+Match clean Hub 25013b51915124fa1da25e5fd37088eadf0e3d2d, full image
+sha256:a1cf39e4b341cda7d5f80a13b8c3272964f43e5341eadbae1b6caafb6a68a31c,
+bundle 5ad36a7492dd7751308eef6fe22c44175079cd212411ffbef580576b7f2597ce,
+and catalog 808f9f635effc5fa845572b976c89696ea2bb86a6a9b6f326e49d1409b570377.
+Keep Core native runner source 0d532f2 separate from Hub source 25013b5.
+
+Reconcile ten fresh Android PASS selectors, the original three-Thread native
+PASS, strict final transport status, exact installed APKs, command exits and
+identity hashes. Preserve the old 81d8f1f failures and this run's initial harness
+errors. Native consumption and transport acceptance have separate evidence;
+one observed dispatch is not a general exactly-once execution guarantee.
+
+Client emulator/reverse cleanup passed. Core retained its Hub/Node fixture for
+its independent audit and owns its final teardown; report that outcome separately.
+Physical Android, public HTTPS, unattended cold wake and a fresh full React
+Native screen flow were not validated. Do not start another model run, broaden
+implementation, change Client files, push, merge or publish as part of review.
+```
+
+## Historical `81d8f1f` candidate and evidence separation
+
+The historical candidate is clean Hub
+`81d8f1f90895f41c4f5ea5c67a6281ccda9e1264`, contract `client-hub-v1.3`,
+image `sha256:0c484d1c10a9fd71e6ae74ddd7fec85ae6ae8cbecf2ece6f90d393892990a04f`.
+Archive SHA-256 is
+`6eaa692cc9e31e0482d94ed9f26ed277dfc91fd37333949d3e2517f498ba4061`;
+catalog SHA-256 is
+`808f9f635effc5fa845572b976c89696ea2bb86a6a9b6f326e49d1409b570377`.
+The imported snapshot is `contracts/client-hub-v1.3-81d8f1f`.
+
+Client validation source is `10cd3dcb3bd73e6513df428ced81d95788e1cb84`.
+The installed product APK remains source
+`9568b2ff6d4e156b70484c10b7fd5195405004b0`, SHA-256
+`f8c82d7091ffebb6add77c003c55a6f033ad657475b51b62b512bef5b0ed8700`.
+The installed AndroidTest APK is SHA-256
+`8c2f122e76e22f6845bbdaf0518146ed94a1f6895abdab1147d3010b4c531e09`.
+The app rebuilt beside this test APK was not installed. The test-only change
+corrects synthetic RFC3339Nano timestamps; production verification is unchanged.
+
+The [first candidate run](client-monitor-v13-81d8f1f-native-validation.md)
+passed 15 Kotlin public-vector tests, nine contract-checker regressions, fixed
+image provenance, and ten Android integration selectors. The latter include
+three actual native Endpoint manifests, external Owner signatures, explicit
+phone grants with `CURRENT`, one accepted Prepare, one outbound Confirm, and a
+read-only final status with two ordered `ACCEPTED` recipients. The evidence tiers
+were `NODE_REPORTED` locally and `RELAY_PERSISTED` remotely.
+
+The full native scenario in that run remains **FAIL**, native exit `1`: the
+local recipient's no-tool recall retained the original context and child message
+ID but omitted the expected body marker. Its preceding structured receive had
+passed exact-body checks. Remote model consumption was **NOT_RUN**. Core
+identified ambiguity in the recall prompt and changed two test prompt strings
+without relaxing the assertions. The failed run was archived and its owned
+resources were removed; cleanup is **PASS**. No Client read of the Hub database
+was involved.
+
+The [fresh recall run](client-monitor-v13-81d8f1f-recall-validation.md) uses a new
+disposable Hub, Android identity and three new original native Threads. Its
+separate native test source is `d76e63009192422d13e0e3b413e857a27866c750`, with
+binary SHA-256
+`15a436025b69c85e74b6151efdc4d0414cc082ff60cd2e0b6b643b47c64ae2e8`.
+The fixed Hub image and both APKs are unchanged. Results from the first run and
+all older images retain their own provenance and are not reused as runtime
+results for this fresh run.
+
+### Fresh-run outcome and command index
+
+**Client Group authorization and explicit consent: PASS. Full native broadcast:
+BLOCKED.** Automatic Codex approval review rejected both MCP attempts in one
+native turn because the sealed payload and Group scope were not independently
+inspectable through the supplied approval ID. The native container exited `1`
+before creating a Monitor outbox or recipient children. No review bypass,
+replacement approval, or further model run was attempted.
+
+The unchanged product UI could not reopen the original operation after launch:
+its status index filters out already reconciled Confirms. This is a remaining
+Client UI limitation, recorded separately from the native review block. No
+product change was made in this checkpoint. A new **test-only** selector in
+Client commit `02cefa94bc6096f7196d1df572a22a1f64774d74` read the actual encrypted
+status without submitting or recovering a write. Its AndroidTest APK SHA-256 is
+`4cbc0e1ff0546b665e55136c1453334e282d19c380e26b63aa8601cd27a3f90b`.
+Only that observation uses this APK; the preceding nine selectors retain test
+APK `8c2f122e…`. Product APK `f8c82d…` remained installed throughout.
+The scoped phone approvals in these selectors use instrumentation-driven
+Android dialogs on the App activity. They do not repeat the complete React
+Native consent-screen acceptance previously recorded under Set H.
+
+The observed status was **APPROVED**, with **zero recipient outcomes**. The
+single status RPC advanced the request sequence once and left no pending
+request. Original operation and Confirm identifiers, Confirm sequence, consent,
+recipient roster and sealed payload remained unchanged. The strict delivered
+status selector was **NOT_RUN** in this fresh attempt. The earlier run's
+`DISPATCH_AUTHORIZED` result must not be substituted for it.
+
+Let `E=/gpu1-share/data/cicada-client/monitor-v13-81d8f1f-recall-20260927T065926Z/evidence`.
+The linked report lists full selectors and artifacts; each command JSON records
+the actual argument list and exit code.
+
+| Check | Result | Command / exit and evidence under `E` |
+|---|---|---|
+| Fixed archive, clean running image and encrypted capabilities | **PASS** | Docker contract checker: `0`; image inspection: `0`; `enrollOwnerAndCheckCapabilities`: ADB/driver `0/0`; `archive-preflight.redacted.json`, `fresh-contract-check.json`, `running-hub-provenance.redacted.json`, `native-enroll-capabilities.json` |
+| Nine Android setup, Group and consent selectors | **PASS** | `python3 scripts/interop/monitor-android.py "$E" test <selector> --label <label>`: each ADB/driver `0/0`, `OK (1 test)`; `native-*.json` selector matrix in the report |
+| Complete native proofs, external Owner signing, three phone grants and `CURRENT` | **PASS** | Core `sign-groups` helper and external signer: `0`; `grantEndpointKeysAndReadCurrent`: `0/0`; `native-scope-comparison.redacted.json`, `owner-sign-groups.json`, `group-key-reviews.redacted.json` |
+| Original native Monitor dispatch and recipient consumption | **BLOCKED** | Core exact binary `TestMCPMonitorBroadcastAndroidClientNative`: container exit `1`; `core-native-blocked.redacted.json` retains the Docker command, source/hash and approval-review outcome |
+| Product UI reopening of an already reconciled Confirm | **BLOCKED** | Bounded navigation wrapper: `1`, no status RPC or new write; `readonly-ui-limitation.redacted.json` |
+| Separate read-only actual-status observation | **PASS** | `./scripts/docker-build-android-test.sh`: `0`; `readOriginalBroadcastStatus`: ADB/driver `0/0`, `OK (1 test)`; `readonly-observation-test-build.json`, `native-observed-status.json`, `android-observed-status.redacted.json` |
+| Strict delivered-status assertion, remote model consumption, physical Android, public HTTPS | **NOT_RUN** | No qualifying result for these gates in this fresh run |
+| Scoped privacy checks and owned-environment cleanup | **PASS** | Document/mount check: `0`; reverse removal, emulator stop and marked Hub fixture stop: `0` each; `client-privacy-preflight.redacted.json`, `native-teardown.redacted.json` |
+
+Core archived its native command, approval-review analysis and scoped Hub scan
+under `/home/zyf/CICADA/.cicada-data/native-joint-recall-d76e630/`. Its scan found
+no synthetic private-body marker in the three scanned Hub artifacts. This is
+Core-owned, bounded evidence; the Client did not inspect the Hub database and
+does not claim a universal plaintext audit. Original Thread identities are
+retained as hashes; raw session records and credentials were not copied. Both
+attempts' disposable Hub/Node state and emulators were removed after evidence
+capture. Resident Hubs were untouched. No push, merge or publication occurred.
+
+### Historical review prompt for the CICADA maintainer
+
+```text
+Review CICADA_CLIENT read-only on dev/react-native:
+- docs/client-monitor-v13-81d8f1f-native-validation.md
+- docs/client-monitor-v13-81d8f1f-recall-validation.md
+- docs/cicada-core-handoff.md and the current working tree / local commits.
+
+Keep clean Hub 81d8f1f90895f41c4f5ea5c67a6281ccda9e1264 and full image
+sha256:0c484d1c10a9fd71e6ae74ddd7fec85ae6ae8cbecf2ece6f90d393892990a04f
+distinct from native test sources 28bd4626 and d76e6300. Verify the archive and
+catalog pins, per-stage APK hashes, commands, exits and cleanup evidence.
+Android Group keys CURRENT and explicit consent passed in both runs. Preserve
+the first native FAIL and the fresh native approval-review BLOCKED result.
+Fresh final encrypted status is APPROVED with zero recipient outcomes;
+the older run's transport evidence is not evidence of this run's dispatch.
+
+The next native acceptance requires an auditable way for automatic approval
+review to verify the phone-authorized exact body, Group and recipient scope.
+Please identify the necessary trusted evidence/interface and its security
+checks. Do not bypass approval review, treat opaque approval IDs as sufficient
+authorization, resend the old confirmation, or relabel blocked work as PASS.
+Deliver any changed protocol, runner and image with independent provenance
+before another bounded native run. No further model call is authorized by this
+handoff itself.
+
+Record the Client's separate UI follow-up: a reconciled Monitor operation
+cannot currently be reopened after app launch. Do not edit CICADA_CLIENT from
+the core thread. Physical Android and public HTTPS remain NOT_RUN. Preserve
+historical N4/N5 and v1.2.1 results under their original images and APKs.
+Do not push, merge, publish or modify production state.
+```
+
+## Historical joint native Monitor attempt — `be0269e`
+
+**FAIL** on the unchanged fixed Hub `be0269e`. The original native Session
+heartbeat was rejected after legacy presence cleanup marked the Endpoint
+offline while its binding remained leased. Core-owned evidence records three
+real original Codex Threads, native process exit `1`, zero model retries and
+zero replacement Threads. The Client did not inspect the Hub database.
+
+The [native acceptance report](client-monitor-v13-native-acceptance.md) records
+commands, exits, redacted identities and stage-specific APKs. Six Android
+selectors passed: device preparation, encrypted enrollment/capabilities, two
+Node confirmations, Group creation, explicit broadcast permission with the
+role-only rejection probe, and independent full Endpoint manifest verification.
+No external Group proof was signed, no Group grant was submitted, and no
+positive Prepare or Confirm was sent. Native dispatch, recipient consumption,
+final status, physical Android and public HTTPS are **NOT_RUN** for this run.
+
+Client test commit `1172000f5ebd03a34b0b589702f1fc7d56409433` adds only a
+read-only final-status selector; its build passed, but the selector was
+**NOT_RUN** because native dispatch was blocked. The installed app remained
+Set H SHA-256 `f8c82d7091ffebb6add77c003c55a6f033ad657475b51b62b512bef5b0ed8700`.
+Later stages used test APK
+`ea6bcc09d456da0fd2b5fb14f11a92ba88f55e965a9eff474af86ccac3512601`.
+The rebuilt app with a different hash was not installed. Core test/helper
+source `877062f30835023a26bd546972aca1e83dcffcac` is separate from the fixed
+Hub image source.
+
+The completed Set H and RPC recovery results below remain historical results
+of their own runs. A core fix or later image does not retroactively pass this
+failed joint attempt. A new fixed candidate and a separate native run remain
+required; neither is part of this Client delivery.
+
+Cleanup is **PASS**: owned reverse removal, emulator stop and marked Hub fixture
+stop each exited `0`; see `native-teardown.redacted.json` in the report's evidence
+directory. Core archived original Thread records before cleanup. They are
+**NATIVE_THREAD_RECORDS_PRESERVED**, while the removed fixture is
+**HUB_BINDING_NOT_RECOVERABLE_AFTER_FIXTURE_CLEANUP**. No resident Hub was targeted.
+No new model run or replacement Thread was started, and nothing was pushed or
+merged.
+
+### Core review prompt
+
+> Read `docs/client-monitor-v13-native-acceptance.md` and the redacted evidence
+> under `/gpu1-share/data/cicada-client/monitor-v13-native-20260927T050925Z/evidence`.
+> Reconcile the six Android PASS selectors with `core-native-failure.redacted.json`
+> and the archived native exit `1`. Preserve the fixed `be0269e` failure and
+> downstream NOT_RUN results. Report the core presence/lease fix and its own
+> regression results separately. Before any future native rerun, deliver a clean
+> source commit, complete image ID, protocol archive and catalog digests plus the
+> exact original-Thread workflow. Do not transfer Set H, RPC recovery or historical
+> v1.2.1 results to the new candidate. Review only; do not push or merge Client.
+
+## Original Set H delivery status
+
+**PASS** for the documented Android emulator protocol and product-interface
+acceptance using synthetic authorization Endpoints. This is not native Monitor
+execution or release acceptance. The disposable Hub, Node state, Owner private
+keys, proxy and emulator have been removed. Only the Client repository changed;
+nothing was pushed, merged, published or deployed to production.
+
+The [fixed-image validation record](client-hub-v1.3-be0269e-validation.md) is the
+complete command, exit-code, artifact and evidence matrix. Historical v1.2.1
+N4/N5, native Group and two-Owner results below retain their original artifacts.
+They are not evidence for the v1.3 target.
+
+## Frozen inputs and tested artifacts
+
+| Item | Value |
+|---|---|
+| Clean Hub source | `be0269e80c41e94881d131bd4f4b233e80b6ffe6` |
+| Contract | `client-hub-v1.3` |
+| Archive SHA-256 | `68a7db6a3238605feb340012886dddd2054a577801154236c39d4ed7d84db2a9` |
+| Catalog SHA-256 | `808f9f635effc5fa845572b976c89696ea2bb86a6a9b6f326e49d1409b570377` |
+| Full Hub image ID | `sha256:6cc7c2c67a8c15ad0bd7879d652cdaf07d5104fac29912ec33f04ac647587783` |
+| Debug app APK SHA-256 | `f8c82d7091ffebb6add77c003c55a6f033ad657475b51b62b512bef5b0ed8700` |
+| AndroidTest APK SHA-256 | `aba2d98487cb3d928b3b10d9401d19fdd4f99d114d326daee6f895a897c34720` |
+
+All 15 imported bundle payloads retain their original bytes. The manifest,
+clean source, image labels and encrypted runtime capabilities were checked
+independently. Current core development changes were not substituted for this
+image. The APKs are development artifacts, not signed release packages.
+
+## Final acceptance summary
+
+Let `E=/gpu1-share/data/cicada-client/monitor-v13-20260927T005634Z-be0269e/evidence`.
+Its directory is `0700`; evidence files are `0600`. The table names only
+restricted evidence paths. Detailed selectors and commands are in the linked
+validation record and each command JSON.
+
+| Check | Result | Command / exit and evidence under `E` |
+|---|---|---|
+| Fixed bundle, image and encrypted capabilities | **PASS** | `python3 scripts/check-client-contract.py`: 0; image inspection: 0; capabilities instrumentation: ADB/driver 0/0, `OK (1 test)`; `final16-runtime-provenance.json`, `final16-capabilities.json` |
+| Independent Kotlin vectors and recovery guards | **PASS** | Four instrumentation suites: ADB/driver 0/0; 6 Monitor, 6 recovery-lock, 4 Endpoint and 5 wire tests; `final16-*-vectors.json`, `final16-recovery-locks.json` |
+| Android build and TypeScript/JavaScript boundary | **PASS** | `./scripts/docker-build-android-test.sh`: 0; Docker TypeScript, JavaScript (13 tests) and ESLint: 0; `android-build-16-native-result-adapter.json`, `final16-{typescript,javascript,eslint}.json` |
+| External Owner proof and explicit Android Group grants | **PASS** | `grantEndpointKeysAndReadCurrent`: ADB/driver 0/0, `OK (1 test)`; three reviewed phone confirmations; `final16-fresh-group-grants.json`, `phase3-fixture-preparation.redacted.json` |
+| Lost Prepare and Confirm HTTP 200 responses | **PASS** | Four instrumentation selectors: ADB/driver 0/0, `OK (1 test)` each; `final16-{dropped,recovered}-{prepare,confirm}.json`; exact original ciphertext retained/recovered, no replacement operation or second Confirm |
+| Changed text, foreign preview, bounded capacity and revoked permission | **PASS** | Three instrumentation selectors: ADB/driver 0/0, `OK (1 test)` each; `final16-reject-body-preview.json`, `final16-capacity.json`, `final16-reject-stale.json`; revocation rejected before a Confirm packet was persisted |
+| Actual React Native consent and status interface | **PASS** | Recorded ADB navigation/input/confirmation commands: 0; UI hierarchy and Client-journal checks: 0; `final16-product-ui.redacted.json`, `final16-fresh-approved-status.private.png`; shows approval and explicitly does not claim delivery |
+| Known-secret scan and isolated environment cleanup | **PASS** | Scoped scan: 0, zero matches; owned proxy/emulator/core fixture stop commands: 0; `privacy-check.redacted.json`, `final16-teardown.redacted.json` |
+| New native Monitor delivery or model consumption | **NOT_RUN** | Synthetic Node/Endpoint authorization fixtures only; core-native results remain separate |
+| Physical Android, dual physical Nodes, public HTTPS | **NOT_RUN** | No qualifying environment run |
+| Live v1.3 Monitor `STILL_PROCESSING`, `OUTCOME_UNCERTAIN`, `RECOVERY_UNAVAILABLE` faults | **NOT_RUN** | Local uncertainty guards passed; historical v1.2.1 live fault tests are not relabeled as v1.3 Monitor acceptance |
+
+No core API blocker remains for the tested protocol/UI slice. The report retains
+earlier failures: an excessive grant/preview lifetime constraint, missing
+current authorization preflight, Fabric parent mounting, and native-to-UI DTO
+mismatch. It also distinguishes expired fixture grants from actual revocation
+tests. Those failures were not relabeled as passing runs.
+
+## Implementation and security boundary
+
+Dedicated Kotlin methods independently verify the complete Endpoint attestation,
+Owner grant, exact consent roster and envelope v2. Before the first Confirm is
+sealed, the session recovers the reviewed Prepare and rereads current topology
+and the source Group grant through encrypted RPC. It validates current identity,
+binding, key and signed revisions, then seals with the reserved Confirm request
+sequence. Topology CAS versions are not substituted for signed revisions.
+
+The exact inner envelope and outer RPC packet are persisted before sending.
+Recovery uses the original packet. The interface now converts the verified
+native RPC result into its explicit display model, and distinguishes a refused
+preflight from a persisted Confirm. Pending or uncertain writes stay blocked;
+read-only reconciliation remains available. No automatic replacement operation
+or silent approval is introduced.
+
+The UI preserves local speech transcription and the existing management screens.
+`external_thread_links=false` continues to prevent ordinary cross-user messaging.
+This acceptance does not establish physical Keystore isolation, public HTTPS,
+blind-Hub peer messaging or runtime/model consumption. Owner private keys and
+Node bearer credentials stayed outside Android, Git and the APK. The scoped
+secret scan is not a universal audit of every possible credential representation.
+
+## Follow-up: Monitor Prepare RPC recovery faults — 2026-09-27
+
+**PASS** for the three bounded recovery-layer scenarios on the same frozen
+Hub `be0269e` image. This is a separate run with fresh disposable Hubs and
+Android device identities; it does not rewrite Set H or demonstrate Monitor
+business execution. The [recovery fault report](client-monitor-v13-recovery-faults.md)
+records the commands, exits, artifact identities, earlier harness failures and
+cleanup evidence.
+
+| Item | Recorded value |
+|---|---|
+| Android test source | `cc634e6ac1937d41fa35234862b9fde70da71c80` |
+| Product implementation / app APK | `9568b2f`; unchanged app SHA-256 `f8c82d7091ffebb6add77c003c55a6f033ad657475b51b62b512bef5b0ed8700` |
+| New AndroidTest APK SHA-256 | `0bb67beb0da959d9518520672720543f709b11024fa0af153c990fc819af9cd2` |
+| Processing runner | `84ed962` |
+| Uncertain / legacy runner | `69ecd268550151c9c786d46445df7eee120f0f30` |
+| `STILL_PROCESSING` | **PASS** — HTTP 409; original pending ciphertext, operation and sequence retained; new Prepare blocked |
+| `OUTCOME_UNCERTAIN` | **PASS** — signed encrypted response after `FAULT_READY` and same-container/same-state restart; reserved response sequence consumed once; original packet retained for reconciliation |
+| `RECOVERY_UNAVAILABLE` | **PASS** — HTTP 409; original pending request retained and fenced |
+| Native delivery, Confirm fault scenarios, physical Android, public HTTPS | **NOT_RUN** in this follow-up |
+
+Each scenario's device preparation, encrypted enrollment/capabilities, capture
+and recovery selector returned ADB/driver exit `0/0` and `OK (1 test)`:
+12 instrumentation tests in total. Three distinct Hub identity hashes and
+Android device key hashes were verified. The fixed core fixture inserts only
+a recovery ledger entry; it does not dispatch `monitor.broadcast_prepare`.
+No Monitor-level recovery lookup or Confirm was called.
+
+Docker reassigned the disposable Hub's published port after restart. The
+runner verified the same container, image, state mount and Hub identity, then
+retargeted only its proxy upstream while preserving the Android origin. The
+original proxy recorded one `FAULT_READY`; the replacement proxy recorded no
+second fault injection. Generic encrypted `status.snapshot` reconciliation
+did not clear the unresolved `PREPARE_UNCERTAIN` metadata or enable a new
+Prepare. These checks do not certify recovery after a real Monitor business
+handler has partially executed.
+
+Evidence root:
+`/gpu1-share/data/cicada-client/monitor-v13-faults-20260927T043238Z/evidence`.
+See `acceptance-summary.redacted.json`, `final-teardown.redacted.json` and each
+scenario's `recovery-result.json`. All owned fixtures, synthetic keys, proxies,
+Android sessions and the emulator were removed. No production code, core
+checkout, resident Hub or frozen artifact was changed; nothing was pushed or
+merged.
+
+## Prompt for the CICADA core developer
+
+> Read `CICADA_CLIENT/docs/cicada-core-handoff.md` and
+> `docs/client-hub-v1.3-be0269e-validation.md` without modifying either repository.
+> Review Client implementation `9568b2ff6d4e156b70484c10b7fd5195405004b0`
+> against the frozen clean Hub `be0269e` inputs above. Check the full Endpoint and
+> Owner proof verification, current authorization preflight, consent/envelope
+> binding, request counters, raw-packet recovery and UI result interpretation.
+> Report concrete mismatches with source or evidence references. Preserve the
+> distinction between this Android synthetic-authorization result and core-native
+> Monitor evidence. Identify a supported disposable native Monitor fixture for a
+> future Android-to-native delivery run, and safe isolated fault drivers for the
+> remaining native-delivery and Confirm recovery cases. Read the separate
+> Prepare recovery-layer report above before proposing additional tests. Do not
+> change the frozen image or contract, inspect databases or credentials, deploy,
+> push, or merge.
+
+---
+
+# Historical handoff: fixed Hub `client-hub-v1.2.1`
 
 **Date:** 2026-09-26
 

@@ -1,18 +1,22 @@
-# Android Client ↔ Hub contract: `client-hub-v1.2.1`
+# Client ↔ Hub contract: `client-hub-v1.3`
 
-**Last updated:** 2026-09-25
+**Last updated:** 2026-09-27
 
-This document follows the imported protocol bundle at [`contracts/client-hub-v1.2.1-967dbd`](../contracts/client-hub-v1.2.1-967dbd/manifest.json). The current fixed target is:
+This document follows the imported protocol bundle at [`contracts/client-hub-v1.3-be0269e`](../contracts/client-hub-v1.3-be0269e/manifest.json). The current fixed target is:
 
 | Item | Value |
 |---|---|
-| Hub source revision | `967dbd885fae9a150b3d9a77c8e4e30da1d0dd8a` |
-| Contract revision | `client-hub-v1.2.1` |
-| Protocol archive SHA-256 | `7bf1e3702eadf9fc3ffd50a0e8ab1213db0844b2bf418b577b88ba239216bf8a` |
-| Catalog SHA-256 | `25c3d7f585b1811781cb46669a09e2e08ab8c58765a7b9318145cea5bbce4df9` |
-| Full Docker image ID | `sha256:adca1c62db5747625141be4506c4f3713368260076c50876776b4dabafa6c1b7` |
+| Hub source revision | `be0269e80c41e94881d131bd4f4b233e80b6ffe6` |
+| Contract revision | `client-hub-v1.3` |
+| Protocol archive SHA-256 | `68a7db6a3238605feb340012886dddd2054a577801154236c39d4ed7d84db2a9` |
+| Catalog SHA-256 | `808f9f635effc5fa845572b976c89696ea2bb86a6a9b6f326e49d1409b570377` |
+| Full Docker image ID | `sha256:6cc7c2c67a8c15ad0bd7879d652cdaf07d5104fac29912ec33f04ac647587783` |
 
-The archive and manifest checks and image labels passed. A separate Android session verified encrypted `session.capabilities`. Results are scoped to this fixed target in the [validation report](client-hub-v1.2.1-967dbd-validation.md); the earlier `41beaf0` report is historical and does not establish behavior of this image.
+The Client independently checks the archive and manifest, clean source and full
+image provenance. Encrypted `session.capabilities` must report this exact
+revision and catalog before operations are enabled. See the [fixed-image
+validation record](client-hub-v1.3-be0269e-validation.md) for the current test
+status. Prior v1.2.1 results apply only to their recorded source and APKs.
 
 ## Trust and authorization
 
@@ -40,7 +44,7 @@ For a missing response, the Client submits the original request packet to `/v2/c
 
 HTTP success does not imply business success. A business rejection is an authenticated encrypted result. Transport failure, Intent dispatch, Goal state, Worker execution, and model consumption remain separate states in the UI.
 
-The current v1.2.1 fixed-image Android validation passed all three deterministic recovery cases on a disposable `/tmp` Hub with an independent Android session. The exact commands and limits are in the [validation report](client-hub-v1.2.1-967dbd-validation.md#recovery-faults-on-the-disposable-fixed-image). This evidence does not authorize direct Hub database access or a production fault switch.
+Historical v1.2.1 fixed-image Android validation passed all three deterministic recovery cases on a disposable `/tmp` Hub with an independent Android session. The exact commands and limits are in the [validation report](client-hub-v1.2.1-967dbd-validation.md#recovery-faults-on-the-disposable-fixed-image). This evidence does not authorize direct Hub database access or a production fault switch.
 
 ## Status, Intent, and management operations
 
@@ -58,26 +62,77 @@ The current v1.2.1 fixed-image Android validation passed all three deterministic
 
 The fixed wire contract keeps `status_events=false` and routable `external_thread_links=false`. Client status pages use partial changes and periodic snapshot reconciliation. Cross-user invitations must be described as proposals, never as a connected Thread or permission to send messages.
 
-## Endpoint attestation v1 correction
+## Monitor consent and envelope v2
 
-The v1.2.1 bundle corrects the published Endpoint attestation signature input. `EndpointKeyAttestation` v1 is compact JSON with ordered fields `version, endpoint_id, principal_id, node_id, binding_id, binding_epoch, public_identity, signature`. To produce unsigned claims, the `signature` field remains present with JSON value `null`. The signature input is:
+All four operations require authenticated allowlist entries. The dedicated native
+bridge prevents generic RPC calls from bypassing proof verification or confirmation.
+Manager and external roles may have these entries; a role name alone grants nothing.
 
-```text
-UTF-8("cicada/fabric/endpoint-key-attestation/v1\x00") || compact_JSON(unsigned_claims)
-```
+| Operation | Client boundary |
+|---|---|
+| `monitor.broadcast_prepare` | Send Group, Monitor Endpoint and SHA-256 of the exact UTF-8 body. Persist the original operation ID. Verify complete Endpoint attestation, Owner-signed Group grant, consent cards, ordered recipient snapshot, revisions, binding and expiry against existing trust anchors. |
+| `monitor.broadcast_confirm` | Require explicit review of exact text, Group, Monitor and every recipient. Refresh the same preview, seal to its independently verified Monitor key, and sign envelope v2 with the device identity. Persist the exact inner envelope and outer encrypted request atomically before sending. |
+| `monitor.broadcast_status` | Read only the reviewed preview. Display approval state and individual `PENDING`, `FAILED`, `UNKNOWN` or `ACCEPTED` outcomes. `NODE_REPORTED` and `RELAY_PERSISTED` mean persistence evidence; neither establishes native consumption or task success. |
+| `monitor.broadcast_recover` | Read-only lookup using the original Prepare operation ID after transport reconciliation. An uncertain Confirm requires Status for the same preview; never create a second approval. |
 
-The new public synthetic vector contains the complete proof, public identity, signed-input bytes, and proof digest. Android must verify the raw proof digest, ML-DSA-65 signature, public-key identity and fingerprint, all endpoint/principal/node/session-binding values and epochs, and the binding and manifest digests before accepting an owner grant. Candidate APK `70423555e96381722d1bdc46633d32c0fca6dc32edae4dfb45865abc1059d197` passed `EndpointAttestationVectorTest` (`OK (4 tests)`), covering the full proof, synthetic manifest digests, and owner proof. Subsequent review found that its timestamp check rejected valid RFC3339Nano timestamps with four fractional digits. That candidate failed the timestamp-compatibility case; the fix is in commit `af3ad451e29d0c43142b3fc792272bbd6df75c84`. The corrected APK `2762a2defd13a0d85bc9a7c96647cbe626f632314ac958d4d1fe689ebd346b76` and AndroidTest APK `711e00f9fee11582c81af14e5a2c9d77799412166a8a3cd7008ec7cb16d27ab0` passed a rebuild and `EndpointAttestationVectorTest` (`OK (4 tests)`, ADB exit 0). A self-attestation proves possession of an Endpoint key, not owner consent or current Hub authority.
+Text remains in memory. The Client neither trims nor normalizes it; malformed
+UTF-16 is rejected before UTF-8 hashing. Only the digest goes to Prepare. The
+Monitor envelope binds exact text, consent, snapshot, preview, device epoch/key,
+Monitor binding, expiry and the accepted Confirm request sequence. The Hub stores
+ciphertext and consent metadata. This specific flow does not establish blind
+routing for other message APIs.
 
-## Runtime validation limits
+`membership.set_broadcast_permission` changes the explicit Group membership
+`message.broadcast` permission using the expected membership version. The
+`monitor` role does not grant this permission. Permission, membership or binding
+changes invalidate prior previews and may require fresh Group key grants.
 
-- Package, manifest, and image-label checks: **PASS**.
-- Encrypted Android `session.capabilities`: **PASS**.
-- Recovery on a disposable fixed-image Hub: **PASS** for `STILL_PROCESSING`, restart-after-`FAULT_READY` `OUTCOME_UNCERTAIN`, and `RECOVERY_UNAVAILABLE`.
-- Corrected Endpoint vector, synthetic-manifest, and owner-proof tests: **PASS** on APK `2762a2defd13a0d85bc9a7c96647cbe626f632314ac958d4d1fe689ebd346b76` (`EndpointAttestationVectorTest`, `OK (4 tests)`, ADB exit 0).
-- RFC3339Nano four-digit fractional timestamp compatibility: **FAIL** on the earlier `70423555…` candidate; **PASS** after the fix in `af3ad451e29d0c43142b3fc792272bbd6df75c84`.
-- Android native Group preview/grant path: implemented with external signed-proof import and explicit user confirmation. No owner private key is imported into the APK.
-- Positive Group grant against the fixed Hub: **PASS** on the final Group APK with a real native Codex Endpoint, independent external Owner signature and on-device confirmation. Status transitioned from `CURRENT` to `STALE` when the native lease expired, then to `PROOF_EXPIRED` after the signed proof expired. See the [separate acceptance record](client-group-key-v1.2.1-disposable-validation.md) for exact artifacts and limits.
-- Real Node/Codex approval against this fixed image: **PASS** on the emulator with APK `70423555…`; same native Thread and Worker attempt 1, one Android approval, Worker/Goal completed, Intent resolved, and `goal.result` byte-matched. It does not establish physical-device or public HTTPS validation.
-- Physical Android device and public HTTPS: **NOT_RUN**.
+Limits are 16 KiB of UTF-8 text, 32 ordered recipients, dispatch batches of eight,
+a five-minute preview and 16 unexpired previews per device / 64 per Owner.
+Backpressure is a temporary-capacity error. Revocation does not immediately free
+an unexpired slot. The Client does not automatically retry Prepare under a new ID.
 
-See the [validation report](client-hub-v1.2.1-967dbd-validation.md) for commands, exits, evidence paths, and the recorded failed initial recovery attempt. Do not infer an unlisted operation's Android compatibility from this protocol document.
+The preview and Owner Group grant have independent validity windows. A current
+grant may expire before the five-minute preview. Confirmation stops at the earlier
+deadline; the original `expires_at` remains unchanged in the signed envelope.
+The Client allows at most five seconds of local clock skew above the Hub's
+five-minute preview duration, without extending either expiry. This is a local
+validation bound, not a different wire TTL. Historical ledger recovery verifies
+the complete proof and remains nonconfirmable after expiry, including after a
+local clock rollback.
+
+Before the first seal, the native session reads `topology.snapshot` and the source
+Monitor's `group.key_status` using the same serialized session state. It checks
+current identity, binding, membership, role and explicit broadcast permission,
+then independently verifies the current Owner grant and Endpoint proof against
+the original consent. Topology management CAS versions are distinct from signed
+Group and membership revisions. These two read permissions are prerequisites
+for the feature. The reads advance RPC counters before the final Confirm sequence
+is allocated. Exact recovery of an already sent Confirm never repeats this
+preflight or creates another sealed payload. The Hub's final guard handles changes
+that occur after the reads; a rejection does not trigger automatic resubmission.
+
+`PREPARED` and `APPROVED` may have an empty or partial recipient outcome ledger.
+The Client validates every reported ordinal and identity; it requires the complete
+roster only at `DISPATCH_AUTHORIZED`. An empty ledger is displayed as absent
+delivery evidence, without inventing recipient results.
+
+## Endpoint attestation and historical evidence
+
+The v1.2.1 correction remains part of v1.3: ordered compact unsigned
+`EndpointKeyAttestation` v1 retains the final `"signature":null` field. Its domain
+is `cicada/fabric/endpoint-key-attestation/v1\0`. Independent Kotlin verification
+checks raw proof SHA-256, full ML-DSA-65 public key and signature, Endpoint /
+Principal / Node / SessionBinding identity and epoch, membership / Group
+revisions, candidate binding and manifest digests, and validity times. A
+self-attestation proves key possession, not Owner consent.
+
+The current Monitor vector exposes public identities, canonical consent and
+signature/AAD bytes. It contains no private Monitor key; its verification must
+not be reported as successful decryption of the published ciphertext. Generated
+local-key round trips are a separate test.
+
+Historical v1.2.1 results are retained in the [fixed-image record](client-hub-v1.2.1-967dbd-validation.md)
+and [native Group acceptance](client-group-key-v1.2.1-disposable-validation.md).
+They do not establish v1.3 behavior. Physical-device security, native Monitor
+execution, dual physical Nodes and public HTTPS each require their own evidence.

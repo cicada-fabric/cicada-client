@@ -386,6 +386,47 @@ object ClientWireCrypto {
         }
     }
 
+    /**
+     * Seals the raw inner E2EE envelope used by Monitor Broadcast v2. The
+     * caller supplies the protocol-specific AAD; KEM, HKDF, GCM, canonical
+     * inner header ordering, and the null-signature ML-DSA input stay shared
+     * with the Client-Control implementation above.
+     */
+    internal fun sealRawEnvelope(
+        sender: Identity,
+        receiver: PublicIdentity,
+        sequence: Long,
+        aad: ByteArray,
+        plaintext: ByteArray,
+    ): String {
+        require(sequence > 0 && plaintext.isNotEmpty()) { "Invalid raw envelope input" }
+        receiver.validate()
+        val encapsulated: SecretWithEncapsulation = MLKEMGenerator(RANDOM).generateEncapsulated(
+            MLKEMPublicKeyParameters(MLKEMParameters.ml_kem_768, receiver.kemPublic),
+        )
+        val secret = encapsulated.secret
+        val kemCiphertext = encapsulated.encapsulation
+        val nonce = ByteArray(12)
+        RANDOM.nextBytes(nonce)
+        try {
+            val key = deriveKey(secret, sequence, aad)
+            val header = envelopeHeader(sequence, kemCiphertext, nonce, sender.publicIdentity)
+            val ciphertext = aesGcm(true, key, nonce, join(aad, bytes(header)), plaintext)
+            val unsigned = envelope(sequence, kemCiphertext, nonce, ciphertext,
+                sender.publicIdentity, null)
+            val signature = sender.sign(bytes(unsigned))
+            return envelope(sequence, kemCiphertext, nonce, ciphertext,
+                sender.publicIdentity, signature)
+        } finally {
+            Arrays.fill(secret, 0.toByte())
+            try {
+                encapsulated.destroy()
+            } catch (_: Exception) {
+                // Best effort release of the provider's encapsulation buffer.
+            }
+        }
+    }
+
     @JvmStatic
     fun openResponse(
         device: Identity,
@@ -518,7 +559,7 @@ object ClientWireCrypto {
             .endObject()
     }
 
-    private fun json(function: (JsonWriter) -> Unit): String {
+    internal fun json(function: (JsonWriter) -> Unit): String {
         try {
             val output = StringWriter()
             val writer = JsonWriter(output)

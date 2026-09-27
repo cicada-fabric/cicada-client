@@ -1,6 +1,8 @@
 # Pinned Client–Hub contract
 
-The active snapshot is [`client-hub-v1.2.1-967dbd/`](client-hub-v1.2.1-967dbd/manifest.json), exported from CICADA commit `967dbd885fae9a150b3d9a77c8e4e30da1d0dd8a` with `source_dirty=false`. The source archive SHA-256 is `7bf1e3702eadf9fc3ffd50a0e8ab1213db0844b2bf418b577b88ba239216bf8a`; the catalog's raw-byte SHA-256 is `25c3d7f585b1811781cb46669a09e2e08ab8c58765a7b9318145cea5bbce4df9`.
+The active snapshot is [`client-hub-v1.3-be0269e/`](client-hub-v1.3-be0269e/manifest.json), exported from CICADA commit `be0269e80c41e94881d131bd4f4b233e80b6ffe6` with `source_dirty=false`. The source archive SHA-256 is `68a7db6a3238605feb340012886dddd2054a577801154236c39d4ed7d84db2a9`; the catalog's raw-byte SHA-256 is `808f9f635effc5fa845572b976c89696ea2bb86a6a9b6f326e49d1409b570377`. The fixed local Hub image is `sha256:6cc7c2c67a8c15ad0bd7879d652cdaf07d5104fac29912ec33f04ac647587783`.
+
+The bundle contains 15 payload files plus its manifest, including the public Monitor consent/envelope v2 vector. Bundled prose was written before the artifact freeze; the core handoff independently supplied the full immutable identities above. Import does not establish Android runtime compatibility. Earlier v1.2.1 evidence retains its original image and APK attribution.
 
 Run `python3 scripts/check-client-contract.py` from the repository root to verify every imported file against the manifest, the complete source commit, the clean-source flag, and the catalog. The original archive was also verified with CICADA's `client-contract.py verify`. Runtime acceptance additionally requires checking the complete Hub image ID and the **encrypted** `session.capabilities` result; neither a mutable image tag nor public capabilities grant device authorization.
 

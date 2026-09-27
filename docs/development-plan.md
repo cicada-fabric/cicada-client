@@ -1,10 +1,35 @@
 # CICADA Client development and validation plan
 
-**Last updated:** 2026-09-25
+**Last updated:** 2026-09-27
 
-This repository develops the mobile Client only. Android is the current target. The fixed integration baseline is Hub commit `967dbd885fae9a150b3d9a77c8e4e30da1d0dd8a`, contract `client-hub-v1.2.1`, protocol archive SHA-256 `7bf1e3702eadf9fc3ffd50a0e8ab1213db0844b2bf418b577b88ba239216bf8a`, catalog SHA-256 `25c3d7f585b1811781cb46669a09e2e08ab8c58765a7b9318145cea5bbce4df9`, and full local image ID `sha256:adca1c62db5747625141be4506c4f3713368260076c50876776b4dabafa6c1b7`. The [backend contract](backend-contract.md) describes the wire behavior; the [v1.2.1 validation report](client-hub-v1.2.1-967dbd-validation.md) records runtime evidence. Results for the earlier `41beaf0` image are historical only.
+This repository develops the mobile Client only. Android is the current target. The completed historical integration baseline was Hub commit `967dbd885fae9a150b3d9a77c8e4e30da1d0dd8a`, contract `client-hub-v1.2.1`, protocol archive SHA-256 `7bf1e3702eadf9fc3ffd50a0e8ab1213db0844b2bf418b577b88ba239216bf8a`, catalog SHA-256 `25c3d7f585b1811781cb46669a09e2e08ab8c58765a7b9318145cea5bbce4df9`, and full local image ID `sha256:adca1c62db5747625141be4506c4f3713368260076c50876776b4dabafa6c1b7`. The [backend contract](backend-contract.md) describes the wire behavior; the [v1.2.1 validation report](client-hub-v1.2.1-967dbd-validation.md) records runtime evidence. Results for the earlier `41beaf0` image are historical only.
 
-## Current status
+## Completed v1.3 Client emulator slice
+
+The fixed target is clean Hub `be0269e80c41e94881d131bd4f4b233e80b6ffe6`,
+contract `client-hub-v1.3`, catalog
+`808f9f635effc5fa845572b976c89696ea2bb86a6a9b6f326e49d1409b570377`,
+archive `68a7db6a3238605feb340012886dddd2054a577801154236c39d4ed7d84db2a9`,
+image `sha256:6cc7c2c67a8c15ad0bd7879d652cdaf07d5104fac29912ec33f04ac647587783`.
+The [dedicated plan and validation record](client-hub-v1.3-be0269e-validation.md)
+tracks the ordered implementation and independent acceptance gates. The user flow
+is exact local text → verified Monitor/recipient review → explicit confirmation
+→ consent-bound sealing → bounded authoritative outcomes. Lost responses must
+retain original request bytes and reconcile the same operation.
+
+Implementation `9568b2ff6d4e156b70484c10b7fd5195405004b0` passed the scoped
+emulator acceptance: 21 Kotlin checks, 13 JavaScript checks, independently
+verified Group grants, actual product consent/status UI, genuine HTTP 200
+response-loss recovery, bounded capacity, changed-text rejection and current
+permission revocation before sealing. The runtime used synthetic authorization
+Endpoints; native Monitor delivery and model consumption remain **NOT_RUN**.
+The report records each APK and keeps earlier failures separate. The disposable
+Hub/Node/proxy/emulator and private fixture material have been removed.
+
+The v1.2.1 status below is historical; none of its Android or native PASS entries
+certifies the new v1.3 target.
+
+## Historical v1.2.1 status
 
 | Area | State |
 |---|---|
@@ -29,7 +54,7 @@ State views distinguish Node connectivity, native session binding, Worker execut
 
 ## Remaining gates
 
-1. Preserve the completed fixed-image Group key trace and add a separate two-Owner fixture when cross-owner authorization needs acceptance. The one-Owner disposable run established the positive path and rejected wrong key selection and nonexistent Group/Endpoint status reads; it did not test a second real Owner.
+1. Resolve the original native Session lease failure documented in the [joint Monitor attempt](client-monitor-v13-native-acceptance.md) before repeating Android-to-native delivery acceptance. No Group grant, positive Prepare or Confirm was submitted in that failed attempt. The separate [Prepare RPC recovery fault run](client-monitor-v13-recovery-faults.md) passed all three ledger-level recovery states; Confirm recovery faults and recovery after actual Monitor business execution remain untested. Preserve the completed v1.2.1 native Group trace and separate [two-Owner authorization acceptance](client-two-owner-v1.2.1-967dbd-validation.md); the latter used synthetic Endpoints and does not establish native messaging.
 2. Preserve the completed fixed-image Node/Codex trace in the validation record. Any new Hub image or Client protocol change needs its own run; do not transfer results from historical `41beaf0` or the separate Group verifier artifact.
 3. Test on a physical Android device: enrollment and Keystore boundary, foreground/background recovery, microphone capture, supported model download and inference, latency, memory, and battery. Mark each item `NOT_RUN` until measured.
 4. Validate production-style public HTTPS, certificate checks, device network behavior, and recovery after network changes. Do not infer this from emulator-to-host HTTP.

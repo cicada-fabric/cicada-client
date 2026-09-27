@@ -1,4 +1,16 @@
 import {NativeModules, Platform} from 'react-native';
+import type {
+  MonitorBroadcastConfirmResult, MonitorBroadcastOperation, MonitorBroadcastPreview,
+  MonitorBroadcastStatus,
+} from './monitorBroadcast';
+import {
+  monitorConfirmResultFromNative, monitorPreviewResultFromNative,
+  monitorStatusResultFromNative,
+} from './monitorBroadcast';
+
+export const CLIENT_HUB_V13_REVISION = 'client-hub-v1.3' as const;
+export const CLIENT_HUB_V13_CATALOG_SHA256 =
+  '808f9f635effc5fa845572b976c89696ea2bb86a6a9b6f326e49d1409b570377' as const;
 
 export type ClientRpcOperation =
   | 'session.capabilities'
@@ -26,15 +38,25 @@ export type ClientRpcOperation =
   | 'link.invite_accept'
   | 'group.key_manifest'
   | 'group.key_grant'
-  | 'group.key_status';
+  | 'group.key_status'
+  | 'link.key_manifest'
+  | 'link.key_grants'
+  | 'link.key_grant'
+  | 'monitor.broadcast_prepare'
+  | 'monitor.broadcast_confirm'
+  | 'monitor.broadcast_recover'
+  | 'monitor.broadcast_status';
+export type MonitorBroadcastRpcOperation = Extract<ClientRpcOperation,
+  'monitor.broadcast_prepare' | 'monitor.broadcast_confirm' |
+  'monitor.broadcast_recover' | 'monitor.broadcast_status'>;
+export type ClientHubGenericRpcOperation = Exclude<ClientRpcOperation, MonitorBroadcastRpcOperation>;
 
 // Link key consent remains unavailable until its separate contract is verified.
-export type ClientHubAdvertisedOperation = ClientRpcOperation |
-  'link.key_manifest' | 'link.key_grants' | 'link.key_grant';
+export type ClientHubAdvertisedOperation = ClientRpcOperation;
 
 export interface ClientHubCapabilities {
   contract: string;
-  contract_revision: 'client-hub-v1.2.1';
+  contract_revision: typeof CLIENT_HUB_V13_REVISION;
   catalog_sha256: string;
   status: 'partial' | 'not_ready' | string;
   planned_platform: string;
@@ -129,8 +151,9 @@ export interface ClientGoalResult {
 export interface ClientHubSessionCapabilities {
   owner_id: string;
   role: 'manager' | 'external' | string;
-  contract_revision: 'client-hub-v1.2.1';
+  contract_revision: typeof CLIENT_HUB_V13_REVISION;
   catalog_sha256: string;
+  rpc_recovery?: boolean;
   available_rpc_operations: ClientHubAdvertisedOperation[];
 }
 
@@ -221,14 +244,39 @@ export interface ClientHubNativeBridge {
   getGroupKeyStatus(input: {groupId: string; endpointId: string}): Promise<{
     ok: boolean; result?: Record<string, unknown>;
   }>;
+  getMonitorBroadcastOperations?(): Promise<{operations: MonitorBroadcastOperation[]}>;
+  monitorBroadcastPrepare?(input: {operationId?: string; groupId: string;
+    monitorEndpointId: string; body: string}): Promise<unknown>;
+  monitorBroadcastRecover?(input: {operationId: string}): Promise<unknown>;
+  monitorBroadcastBodyMatches?(input: {previewId: string; body: string}):
+    Promise<{matches: boolean; bodySha256: string}>;
+  monitorBroadcastConfirm?(input: {previewId: string; body: string;
+    consentDigest: string}): Promise<unknown>;
+  monitorBroadcastStatus?(input: {previewId: string}): Promise<unknown>;
 }
 
-export interface ClientHubApi extends Omit<ClientHubNativeBridge, 'getStatus' | 'getGroupKeyStatus'> {
+export interface ClientHubApi extends Omit<ClientHubNativeBridge,
+  'getStatus' | 'getGroupKeyStatus' | 'rpc' | 'getMonitorBroadcastOperations' |
+  'monitorBroadcastPrepare' | 'monitorBroadcastRecover' |
+  'monitorBroadcastBodyMatches' |
+  'monitorBroadcastConfirm' | 'monitorBroadcastStatus'> {
   getStatus(): Promise<ClientHubStatus>;
+  rpc(input: {operation: ClientHubGenericRpcOperation; body: Record<string, unknown>;
+    operationId?: string}): Promise<unknown>;
   goalResult(input: ClientGoalResultRequest): Promise<ClientGoalResult>;
   groupKeyStatus(input: {groupId: string; endpointId: string}): Promise<{
     ok: boolean; result?: Record<string, unknown>;
   }>;
+  readonly monitorBroadcastReady: boolean;
+  getMonitorBroadcastOperations(): Promise<{operations: MonitorBroadcastOperation[]}>;
+  monitorBroadcastPrepare(input: {operationId?: string; groupId: string;
+    monitorEndpointId: string; body: string}): Promise<MonitorBroadcastPreview>;
+  monitorBroadcastRecover(input: {operationId: string}): Promise<MonitorBroadcastPreview>;
+  monitorBroadcastBodyMatches(input: {previewId: string; body: string}):
+    Promise<{matches: boolean; bodySha256: string}>;
+  monitorBroadcastConfirm(input: {previewId: string; body: string;
+    consentDigest: string}): Promise<MonitorBroadcastConfirmResult>;
+  monitorBroadcastStatus(input: {previewId: string}): Promise<MonitorBroadcastStatus>;
 }
 
 const native = NativeModules.CicadaClientHub as ClientHubNativeBridge | undefined;
@@ -256,6 +304,9 @@ const operationNames: ClientRpcOperation[] = [
   'link.list',
   'link.invite_create', 'link.invite_preview', 'link.invite_accept',
   'group.key_manifest', 'group.key_grant', 'group.key_status',
+  'link.key_manifest', 'link.key_grants', 'link.key_grant',
+  'monitor.broadcast_prepare', 'monitor.broadcast_confirm',
+  'monitor.broadcast_recover', 'monitor.broadcast_status',
 ];
 const isRpcOperation = (value: string): value is ClientRpcOperation =>
   operationNames.includes(value as ClientRpcOperation);
@@ -273,6 +324,10 @@ const normalizeStatus = (value: NativeClientHubStatus): ClientHubStatus => ({
  * inside the Android bridge. This facade never exposes a /v1 bearer route.
  */
 export const clientHub: ClientHubApi = Platform.OS === 'android' && native ? {
+  monitorBroadcastReady: Boolean(native.getMonitorBroadcastOperations &&
+    native.monitorBroadcastPrepare && native.monitorBroadcastRecover &&
+    native.monitorBroadcastBodyMatches && native.monitorBroadcastConfirm &&
+    native.monitorBroadcastStatus),
   getStatus: async () => normalizeStatus(await native.getStatus()),
   fetchHubMetadata: input => native.fetchHubMetadata(input),
   pinHub: input => native.pinHub(input),
@@ -293,7 +348,42 @@ export const clientHub: ClientHubApi = Platform.OS === 'android' && native ? {
   previewGroupKey: input => native.previewGroupKey(input),
   grantGroupKey: input => native.grantGroupKey(input),
   groupKeyStatus: input => native.getGroupKeyStatus(input),
+  getMonitorBroadcastOperations: async () => {
+    if (!native.getMonitorBroadcastOperations) return unavailable();
+    return native.getMonitorBroadcastOperations();
+  },
+  monitorBroadcastPrepare: async input => {
+    if (!native.monitorBroadcastPrepare) return unavailable();
+    return monitorPreviewResultFromNative(await native.monitorBroadcastPrepare(input), {
+      operationId: input.operationId,
+      groupId: input.groupId,
+      monitorEndpointId: input.monitorEndpointId,
+    });
+  },
+  monitorBroadcastRecover: async input => {
+    if (!native.monitorBroadcastRecover) return unavailable();
+    return monitorPreviewResultFromNative(await native.monitorBroadcastRecover(input), {
+      operationId: input.operationId,
+    });
+  },
+  monitorBroadcastBodyMatches: async input => {
+    if (!native.monitorBroadcastBodyMatches) return unavailable();
+    return native.monitorBroadcastBodyMatches(input);
+  },
+  monitorBroadcastConfirm: async input => {
+    if (!native.monitorBroadcastConfirm) return unavailable();
+    return monitorConfirmResultFromNative(
+      await native.monitorBroadcastConfirm(input), input.previewId,
+    );
+  },
+  monitorBroadcastStatus: async input => {
+    if (!native.monitorBroadcastStatus) return unavailable();
+    return monitorStatusResultFromNative(
+      await native.monitorBroadcastStatus(input), input.previewId,
+    );
+  },
 } : {
+  monitorBroadcastReady: false,
   getStatus: async () => unavailableStatus,
   fetchHubMetadata: () => unavailable(),
   pinHub: () => unavailable(),
@@ -308,6 +398,12 @@ export const clientHub: ClientHubApi = Platform.OS === 'android' && native ? {
   previewGroupKey: () => unavailable(),
   grantGroupKey: () => unavailable(),
   groupKeyStatus: () => unavailable(),
+  getMonitorBroadcastOperations: () => unavailable(),
+  monitorBroadcastPrepare: () => unavailable(),
+  monitorBroadcastRecover: () => unavailable(),
+  monitorBroadcastBodyMatches: () => unavailable(),
+  monitorBroadcastConfirm: () => unavailable(),
+  monitorBroadcastStatus: () => unavailable(),
 };
 
 export function operationAllowed(
@@ -317,7 +413,8 @@ export function operationAllowed(
   if (status.uncertainNeedsReconciliation && [
     'goal.lifecycle', 'topology.apply', 'devices.revoke', 'nodes.confirm',
     'nodes.revoke', 'approvals.decide', 'intent.submit', 'link.invite_create',
-    'link.invite_accept', 'group.key_grant',
+    'link.invite_accept', 'group.key_grant', 'monitor.broadcast_prepare',
+    'monitor.broadcast_confirm',
   ].includes(operation)) return false;
   return status.nativeAvailable && status.remoteEnabled &&
     status.sessionCapabilitiesReady && !status.pendingOperationId &&

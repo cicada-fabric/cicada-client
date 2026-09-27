@@ -3,8 +3,8 @@
 This helper creates a **synthetic Endpoint for authorization testing only**.
 It does not create or verify a native Codex/Thread session. Use it only with a
 new disposable Hub built from CICADA commit
-`967dbd885fae9a150b3d9a77c8e4e30da1d0dd8a` and the fixed
-`client-hub-v1.2.1` contract. The helper uses only supported Node Join,
+`967dbd885fae9a150b3d9a77c8e4e30da1d0dd8a` (`client-hub-v1.2.1`) or
+`be0269e80c41e94881d131bd4f4b233e80b6ffe6` (`client-hub-v1.3`). The helper uses only supported Node Join,
 `whoami`, and Endpoint key candidate APIs; it has no database access or
 production fault path.
 
@@ -36,6 +36,13 @@ repository and `GO_BUILDER_IMAGE` selects the Go 1.27.1 build image.
 ```sh
 scripts/interop/two_owner_node_fixture/build.sh
 ```
+
+The default remains the historical v1.2.1 source. For the frozen Monitor protocol
+fixture, set `FIXTURE_CORE_COMMIT=be0269e80c41e94881d131bd4f4b233e80b6ffe6`
+and use a separate `FIXTURE_BUILD_ROOT` ending in `two-owner-node-fixture-build`.
+The script accepts only these complete source commits and embeds the selected
+source in the helper's public result. Synthetic Monitor and recipient Endpoints
+are protocol fixtures; they never establish native Monitor execution.
 
 The binary is written to
 `/gpu1-share/data/cicada-client/two-owner-node-fixture-build/bin/two-owner-node-fixture`.

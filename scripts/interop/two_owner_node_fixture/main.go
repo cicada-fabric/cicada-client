@@ -25,7 +25,8 @@ import (
 	"github.com/cicada-ai/cicada/internal/e2ee"
 )
 
-const sourceCommit = "967dbd885fae9a150b3d9a77c8e4e30da1d0dd8a"
+// Set by the fixed-source build script; never infer provenance from a worktree.
+var sourceCommit = "UNSET"
 
 type spec struct {
 	SchemaVersion          int    `json:"schema_version"`
