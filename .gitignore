@@ -1,5 +1,6 @@
 # Android and Gradle
 .gradle/
+android/.kotlin/
 **/build/
 node_modules/
 **/.cxx/

@@ -22,6 +22,8 @@ import java.net.URL
 import java.nio.charset.StandardCharsets
 import java.security.KeyStore
 import java.security.MessageDigest
+import java.time.Instant
+import java.time.temporal.ChronoUnit
 import java.util.UUID
 import java.util.concurrent.locks.ReentrantLock
 import javax.crypto.Cipher
@@ -51,8 +53,8 @@ class ClientHubSession(context: Context) {
     companion object {
         private const val KEY_ALIAS = "ai.cicada.client.hub.device-wrap.v1"
         private val KEY_AAD = "cicada/android/client-device-key/wrap/v1\u0000".toByteArray(StandardCharsets.UTF_8)
-        private const val CONTRACT_REVISION = "client-hub-v1.2"
-        private const val CATALOG_SHA256 = "613084ee67f75d27762ddaf59ec2e5b33ebea7383cbfcf455a50b472e756c66a"
+        private const val CONTRACT_REVISION = "client-hub-v1.2.1"
+        private const val CATALOG_SHA256 = "25c3d7f585b1811781cb46669a09e2e08ab8c58765a7b9318145cea5bbce4df9"
         private const val MAX_BODY_BYTES = 64 * 1024
         private const val MAX_PACKET_BYTES = 256 * 1024
         private const val MAX_RESPONSE_BYTES = 256 * 1024
@@ -66,13 +68,21 @@ class ClientHubSession(context: Context) {
             "nodes.preview", "nodes.confirm", "nodes.list", "nodes.revoke",
             "approvals.list", "approvals.decide", "goal.result", "intent.get", "intent.status",
             "intent.list", "intent.submit", "link.list", "link.invite_create", "link.invite_preview",
-            "link.invite_accept",
+            "link.invite_accept", "group.key_manifest", "group.key_grant", "group.key_status",
         )
         private val MUTATING_RPC_OPERATIONS = setOf(
             "goal.lifecycle", "topology.apply", "devices.revoke", "nodes.confirm",
             "nodes.revoke", "approvals.decide", "intent.submit", "link.invite_create",
-            "link.invite_accept",
+            "link.invite_accept", "group.key_grant",
         )
+
+        /** HTTP is limited to the historical emulator route or a local ADB reverse port. */
+        internal fun isDebugHttpHubAllowed(host: String, port: Int,
+                                           debugBuild: Boolean, emulator: Boolean): Boolean =
+            debugBuild && (
+                host == "10.0.2.2" && port in setOf(8787, 8788, 8789, 8790, 8792, 8794, 8795) ||
+                    emulator && host == "127.0.0.1" && port in 1024..65535
+                )
     }
 
     private data class Pin(
@@ -112,6 +122,7 @@ class ClientHubSession(context: Context) {
     private data class State(
         var pin: Pin? = null,
         var enrollment: Enrollment? = null,
+        var ownerApprovalPublicIdentityJson: String? = null,
         var nextSequence: Long = 1,
         var lastResponseSequence: Long = 0,
         var role: String? = null,
@@ -187,6 +198,7 @@ class ClientHubSession(context: Context) {
             state.previousDeviceMayRemainOnHub = state.enrollment != null || state.previousDeviceMayRemainOnHub
             if (state.pending != null) state.retiredPending = state.pending
             state.enrollment = null
+            state.ownerApprovalPublicIdentityJson = null
             state.nextSequence = 1
             state.lastResponseSequence = 0
             state.role = null
@@ -246,6 +258,7 @@ class ClientHubSession(context: Context) {
         state.previousDeviceMayRemainOnHub = state.enrollment != null || state.previousDeviceMayRemainOnHub
         if (state.pending != null) state.retiredPending = state.pending
         state.enrollment = null
+        state.ownerApprovalPublicIdentityJson = null
         state.nextSequence = 1
         state.lastResponseSequence = 0
         state.role = null
@@ -332,6 +345,7 @@ class ClientHubSession(context: Context) {
             state.enrollmentAttempt = EnrollmentAttempt(
                 checkedOwner, checkedDeviceId, deviceIdentity.publicIdentity.id, grantDigest, requestJson,
             )
+            state.ownerApprovalPublicIdentityJson = ownerPublic.toJson()
             writeState(state) // An ambiguous POST must not be recreated with a new nonce or device key.
             val response = httpJson(pin.baseUrl, "/v2/client/devices/enroll", "POST", requestJson, 48 * 1024, expectedStatus = 201)
             finishEnrollment(state, response, state.enrollmentAttempt!!)
@@ -406,6 +420,9 @@ class ClientHubSession(context: Context) {
 
     /** Starts one encrypted RPC after persisting sequence and exact request bytes. */
     fun rpc(operation: String, body: JsonObject, operationId: String? = null): JsonObject = PROCESS_LOCK.withLock {
+        if (operation.startsWith("group.key_")) {
+            throw HubSessionException("VERIFIED_GROUP_FLOW_REQUIRED", "Use the verified Group key consent flow")
+        }
         val state = readState()
         requireReadyForRpc(state)
         if (state.pending != null) {
@@ -413,6 +430,126 @@ class ClientHubSession(context: Context) {
         }
         validateOperation(state, operation)
         createAndSend(state, operation, body, operationId)
+    }
+
+    /** Returns a manifest only after independent proof and digest validation. */
+    fun previewGroupKey(groupId: String, endpointId: String, ownerKeyId: String): JsonObject =
+        PROCESS_LOCK.withLock {
+            val state = readState()
+            requireReadyForRpc(state)
+            if (state.pending != null) throw HubSessionException("PENDING_RECOVERY_REQUIRED", "Recover the original request first")
+            validateOperation(state, "group.key_manifest")
+            val trustedOwner = state.ownerApprovalPublicIdentityJson
+                ?: throw HubSessionException("OWNER_PUBLIC_KEY_REQUIRED", "A pinned owner approval key is required")
+            val trustedKeyId = try { ClientWireCrypto.PublicIdentity.parse(
+                parseObject(trustedOwner, "Invalid owner key")).id }
+                catch (_: Exception) { throw HubSessionException("OWNER_PUBLIC_KEY_INVALID", "Saved owner approval key is invalid") }
+            if (trustedKeyId != ownerKeyId) {
+                throw HubSessionException("OWNER_KEY_ID_MISMATCH", "Selected owner key differs from the enrollment trust key")
+            }
+            val issued = Instant.now().truncatedTo(ChronoUnit.SECONDS)
+            val response = createAndSend(state, "group.key_manifest", groupManifestRequest(
+                groupId, endpointId, ownerKeyId, issued.toString(), issued.plusSeconds(900).toString()), null)
+            verifiedGroupManifest(response, state, groupId, endpointId, ownerKeyId)
+        }
+
+    /**
+     * Reads and verifies the exact manifest named by an externally signed
+     * Owner proof. This is used to show the object being approved before the
+     * separate grant call re-reads it under the same digest guard.
+     */
+    fun previewGroupKeyGrant(groupId: String, endpointId: String, ownerKeyId: String,
+                             expectedDigest: String, signedProofBase64: String): JsonObject =
+        PROCESS_LOCK.withLock {
+            val state = readState()
+            requireReadyForRpc(state)
+            if (state.pending != null) throw HubSessionException("PENDING_RECOVERY_REQUIRED", "Recover the original request first")
+            verifiedGroupManifestForOwnerProof(state, groupId, endpointId, ownerKeyId,
+                expectedDigest, signedProofBase64)
+        }
+
+    /** Requires a separate owner signature and a fresh, identical Hub manifest. */
+    fun grantGroupKey(groupId: String, endpointId: String, ownerKeyId: String,
+                      expectedDigest: String, signedProofBase64: String): JsonObject = PROCESS_LOCK.withLock {
+        val state = readState()
+        requireReadyForRpc(state)
+        if (state.pending != null) throw HubSessionException("PENDING_RECOVERY_REQUIRED", "Recover the original request first")
+        validateOperation(state, "group.key_grant")
+        val verified = verifiedGroupManifestForOwnerProof(state, groupId, endpointId,
+            ownerKeyId, expectedDigest, signedProofBase64)
+        createAndSend(state, "group.key_grant", JsonObject().apply {
+            addProperty("group_id", groupId)
+            addProperty("endpoint_id", endpointId)
+            addProperty("owner_key_id", ownerKeyId)
+            addProperty("signed_proof", signedProofBase64)
+        }, null)
+    }
+
+    /** Reads the current owner-scoped Group key grant through encrypted RPC. */
+    fun groupKeyStatus(groupId: String, endpointId: String): JsonObject = PROCESS_LOCK.withLock {
+        val state = readState()
+        requireReadyForRpc(state)
+        if (state.pending != null) throw HubSessionException("PENDING_RECOVERY_REQUIRED", "Recover the original request first")
+        validateOperation(state, "group.key_status")
+        createAndSend(state, "group.key_status", JsonObject().apply {
+            addProperty("group_id", groupId)
+            addProperty("endpoint_id", endpointId)
+        }, null)
+    }
+
+    private fun verifiedGroupManifestForOwnerProof(state: State, groupId: String,
+                                                    endpointId: String, ownerKeyId: String,
+                                                    expectedDigest: String,
+                                                    signedProofBase64: String): JsonObject {
+        validateOperation(state, "group.key_manifest")
+        val ownerJson = state.ownerApprovalPublicIdentityJson
+            ?: throw HubSessionException("OWNER_PUBLIC_KEY_REQUIRED", "Re-enroll with a pinned owner approval key before signing Group consent")
+        val owner = try { ClientWireCrypto.PublicIdentity.parse(parseObject(ownerJson, "Invalid owner key")) }
+            catch (_: Exception) { throw HubSessionException("OWNER_PUBLIC_KEY_INVALID", "Saved owner approval key is invalid") }
+        if (owner.id != ownerKeyId || !expectedDigest.matches(Regex("[0-9a-f]{64}"))) {
+            throw HubSessionException("GROUP_CONSENT_MISMATCH", "Owner key or reviewed manifest digest differs")
+        }
+        val proof = try { decodeCanonicalBase64(signedProofBase64) }
+            catch (_: Exception) { throw HubSessionException("GROUP_OWNER_PROOF_INVALID", "Owner proof is not canonical base64") }
+        if (proof.size > 16 * 1024) throw HubSessionException("GROUP_OWNER_PROOF_INVALID", "Owner proof exceeds the protocol limit")
+        val proofJson = try { JsonParser.parseString(String(proof, StandardCharsets.UTF_8)).asJsonObject }
+            catch (_: Exception) { throw HubSessionException("GROUP_OWNER_PROOF_INVALID", "Owner proof is not JSON") }
+        val issuedAt = try { requiredString(proofJson, "issued_at") }
+            catch (_: Exception) { throw HubSessionException("GROUP_OWNER_PROOF_INVALID", "Owner proof has no issued_at") }
+        val expiresAt = try { requiredString(proofJson, "expires_at") }
+            catch (_: Exception) { throw HubSessionException("GROUP_OWNER_PROOF_INVALID", "Owner proof has no expires_at") }
+        val manifestResponse = createAndSend(state, "group.key_manifest",
+            groupManifestRequest(groupId, endpointId, ownerKeyId, issuedAt, expiresAt), null)
+        val verified = verifiedGroupManifest(manifestResponse, state, groupId, endpointId, ownerKeyId)
+        val manifest = verified.getAsJsonObject("result")
+        if (requiredString(manifest, "digest") != expectedDigest) {
+            throw HubSessionException("GROUP_MANIFEST_STALE", "Group key binding or manifest changed; review a new manifest")
+        }
+        try { GroupKeyOwnerProof.verify(proof, manifest, owner) }
+        catch (_: Exception) { throw HubSessionException("GROUP_OWNER_PROOF_INVALID", "Owner signature or manifest binding is invalid") }
+        return verified
+    }
+
+    private fun groupManifestRequest(groupId: String, endpointId: String, ownerKeyId: String,
+                                     issuedAt: String, expiresAt: String): JsonObject = JsonObject().apply {
+        addProperty("group_id", groupId)
+        addProperty("endpoint_id", endpointId)
+        addProperty("owner_key_id", ownerKeyId)
+        addProperty("issued_at", issuedAt)
+        addProperty("expires_at", expiresAt)
+    }
+
+    private fun verifiedGroupManifest(response: JsonObject, state: State, groupId: String,
+                                      endpointId: String, ownerKeyId: String): JsonObject {
+        val manifest = response.get("result")?.takeIf { it.isJsonObject }?.asJsonObject
+            ?: throw HubSessionException("GROUP_MANIFEST_UNAVAILABLE", "Hub did not return a Group key manifest")
+        try {
+            GroupKeyManifestVerifier.verifyManifest(manifest, state.pin!!.hubId,
+                state.enrollment!!.ownerId, groupId, endpointId, ownerKeyId)
+        } catch (_: Exception) {
+            throw HubSessionException("GROUP_MANIFEST_INVALID", "Endpoint proof, binding or manifest digest is invalid or expired")
+        }
+        return response.deepCopy().apply { addProperty("verified", true) }
     }
 
     /** Asks Hub to recover the exact persisted packet without dispatching the operation again. */
@@ -892,6 +1029,7 @@ class ClientHubSession(context: Context) {
                 requiredString(value, "state"),
             )
         }
+        state.ownerApprovalPublicIdentityJson = optionalString(json, "ownerApprovalPublicIdentityJson")
         state.nextSequence = optionalLong(json, "nextSequence") ?: 1L
         state.lastResponseSequence = optionalLong(json, "lastResponseSequence") ?: 0L
         state.role = optionalString(json, "role")
@@ -967,6 +1105,7 @@ class ClientHubSession(context: Context) {
                 addProperty("state", enrollment.state)
             })
         }
+        json.addProperty("ownerApprovalPublicIdentityJson", state.ownerApprovalPublicIdentityJson)
         json.addProperty("nextSequence", state.nextSequence)
         json.addProperty("lastResponseSequence", state.lastResponseSequence)
         json.addProperty("role", state.role)
@@ -1031,14 +1170,25 @@ class ClientHubSession(context: Context) {
         if (scheme == "https") {
             if (uri.port != -1 && uri.port !in 1..65535) throw HubSessionException("INVALID_HUB_URL", "Hub HTTPS port is invalid")
         } else if (scheme == "http") {
-            if (!BuildConfig.DEBUG || host != "10.0.2.2" || uri.port !in setOf(8787, 8788, 8789, 8790, 8792, 8794, 8795)) {
-                throw HubSessionException("INSECURE_HUB_URL", "HTTP is allowed only from a debug build to the local emulator Hub ports")
+            if (!isDebugHttpHubAllowed(host, uri.port, BuildConfig.DEBUG, isAndroidEmulator())) {
+                throw HubSessionException("INSECURE_HUB_URL", "HTTP is allowed only from a debug emulator to approved local Hub ports")
             }
         } else {
             throw HubSessionException("INSECURE_HUB_URL", "Hub URL must use HTTPS")
         }
         val port = if (uri.port == -1) "" else ":${uri.port}"
         return "$scheme://$host$port"
+    }
+
+    private fun isAndroidEmulator(): Boolean {
+        val hardware = Build.HARDWARE.lowercase()
+        val fingerprint = Build.FINGERPRINT.lowercase()
+        val model = Build.MODEL.lowercase()
+        val product = Build.PRODUCT.lowercase()
+        return hardware == "ranchu" || hardware == "goldfish" ||
+            model.contains("android sdk built for") ||
+            (fingerprint.startsWith("generic/") &&
+                (model.contains("emulator") || product.startsWith("sdk_gphone")))
     }
 
     private fun httpJson(

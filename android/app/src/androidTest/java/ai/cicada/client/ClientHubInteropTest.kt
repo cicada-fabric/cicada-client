@@ -65,28 +65,38 @@ class ClientHubInteropTest {
             badSource.get("ok").asBoolean)
     }
 
-    @Test fun currentV12ExternalReadsUseEncryptedCapabilitiesAndKeepKeyRpcDisabled() {
+    @Test fun currentV121ExternalReadsUseEncryptedCapabilitiesAndGuardKeyRpc() {
         val before = session.getStatus()
         assertTrue(before.get("remoteEnabled").asBoolean)
         val cap = session.rpc("session.capabilities", JsonObject())
         assertTrue(cap.get("ok").asBoolean)
         val result = cap.getAsJsonObject("result")
         assertEquals("external", result.get("role").asString)
-        assertEquals("client-hub-v1.2", result.get("contract_revision").asString)
-        assertEquals("613084ee67f75d27762ddaf59ec2e5b33ebea7383cbfcf455a50b472e756c66a",
+        assertEquals("client-hub-v1.2.1", result.get("contract_revision").asString)
+        assertEquals("25c3d7f585b1811781cb46669a09e2e08ab8c58765a7b9318145cea5bbce4df9",
             result.get("catalog_sha256").asString)
 
         val allowed = session.getStatus().getAsJsonArray("allowedOperations").map { it.asString }
         assertTrue(allowed.contains("status.snapshot"))
         assertTrue(allowed.contains("status.changes"))
-        for (operation in listOf("link.key_manifest", "link.key_grants", "link.key_grant",
-            "group.key_manifest", "group.key_grant", "group.key_status")) {
+        for (operation in listOf("link.key_manifest", "link.key_grants", "link.key_grant")) {
             assertFalse("Unverified key operation is not callable: $operation", allowed.contains(operation))
             try {
                 session.rpc(operation, JsonObject())
                 fail("Unverified key operation reached the Hub: $operation")
             } catch (error: HubSessionException) {
                 assertEquals("UNSUPPORTED_RPC_OPERATION", error.errorCode)
+            }
+        }
+        assertTrue(allowed.contains("group.key_manifest"))
+        assertTrue(allowed.contains("group.key_grant"))
+        assertTrue(allowed.contains("group.key_status"))
+        for (operation in listOf("group.key_manifest", "group.key_grant", "group.key_status")) {
+            try {
+                session.rpc(operation, JsonObject())
+                fail("Raw Group key operation bypassed the verified flow: $operation")
+            } catch (error: HubSessionException) {
+                assertEquals("VERIFIED_GROUP_FLOW_REQUIRED", error.errorCode)
             }
         }
 
@@ -225,14 +235,19 @@ class ClientHubInteropTest {
         rejected("intent.get", JsonObject().apply {
             addProperty("intent_id", "missing-intent-android-matrix")
         })
-        for (operation in listOf("link.key_manifest", "link.key_grants", "link.key_grant",
-            "group.key_manifest", "group.key_grant", "group.key_status")) {
+        for (operation in listOf("link.key_manifest", "link.key_grants", "link.key_grant")) {
             try {
                 session.rpc(operation, JsonObject())
                 fail("Unverified key operation must remain disabled: $operation")
             } catch (error: HubSessionException) {
                 assertEquals("UNSUPPORTED_RPC_OPERATION", error.errorCode)
             }
+        }
+        try {
+            session.rpc("group.key_grant", JsonObject())
+            fail("Raw Group key grant bypassed owner proof verification")
+        } catch (error: HubSessionException) {
+            assertEquals("VERIFIED_GROUP_FLOW_REQUIRED", error.errorCode)
         }
         rejected("link.invite_accept", JsonObject().apply {
             addProperty("token", "invalid-test-token")
@@ -297,8 +312,8 @@ class ClientHubInteropTest {
         val cap = session.rpc("session.capabilities", JsonObject(), "android-capabilities-1")
         assertTrue(cap.get("ok").asBoolean)
         assertEquals(expectedRole, cap.getAsJsonObject("result").get("role").asString)
-        assertEquals("client-hub-v1.2", cap.getAsJsonObject("result").get("contract_revision").asString)
-        assertEquals("613084ee67f75d27762ddaf59ec2e5b33ebea7383cbfcf455a50b472e756c66a",
+        assertEquals("client-hub-v1.2.1", cap.getAsJsonObject("result").get("contract_revision").asString)
+        assertEquals("25c3d7f585b1811781cb46669a09e2e08ab8c58765a7b9318145cea5bbce4df9",
             cap.getAsJsonObject("result").get("catalog_sha256").asString)
         val snapshot = session.rpc("status.snapshot", JsonObject(), "android-snapshot-2")
         assertTrue(snapshot.get("ok").asBoolean)
@@ -337,9 +352,9 @@ class ClientHubInteropTest {
         assertEquals(1L, recovered.get("deviceKeyVersion").asLong)
         val cap = resumed.rpc("session.capabilities", JsonObject())
         assertTrue(cap.get("ok").asBoolean)
-        assertEquals("client-hub-v1.2", cap.getAsJsonObject("result")
+        assertEquals("client-hub-v1.2.1", cap.getAsJsonObject("result")
             .get("contract_revision").asString)
-        assertEquals("613084ee67f75d27762ddaf59ec2e5b33ebea7383cbfcf455a50b472e756c66a",
+        assertEquals("25c3d7f585b1811781cb46669a09e2e08ab8c58765a7b9318145cea5bbce4df9",
             cap.getAsJsonObject("result").get("catalog_sha256").asString)
         assertFalse(resumed.getStatus().get("enrollmentRecoveryRequired").asBoolean)
     }
@@ -363,6 +378,115 @@ class ClientHubInteropTest {
         assertEquals(operationId, recovered.get("operationId").asString)
         assertEquals(beforeSequence, resumed.getStatus().get("nextSequence").asLong)
         assertFalse(resumed.getStatus().has("pendingOperationId"))
+    }
+
+    private fun pendingSnapshot(): JsonObject = JsonParser.parseString(File(
+        instrumentation.targetContext.noBackupFilesDir, "client-hub/session-state.json",
+    ).readText(StandardCharsets.UTF_8)).asJsonObject.getAsJsonObject("pending")
+
+    @Test fun switchEnrolledSessionToIsolatedFaultProxy() {
+        val trusted = JsonParser.parseString(decoded("trusted_hub_identity_base64")).asJsonObject
+        val before = session.getStatus()
+        assertTrue(before.get("remoteEnabled").asBoolean)
+        val pin = session.pinHub(argument("fault_proxy_base_url"),
+            trusted.get("hub_id").asString,
+            trusted.getAsJsonObject("control_public_identity").toString())
+        assertTrue(pin.get("pinned").asBoolean)
+        val after = session.getStatus()
+        assertEquals(before.get("ownerId"), after.get("ownerId"))
+        assertEquals(before.get("nextSequence"), after.get("nextSequence"))
+        assertTrue(after.get("remoteEnabled").asBoolean)
+    }
+
+    @Test fun faultProxyPersistsOneExactSnapshotPacket() {
+        val before = session.getStatus()
+        assertTrue(before.get("remoteEnabled").asBoolean)
+        val sequence = before.get("nextSequence").asLong
+        val operationId = "android-v121-fault-${UUID.randomUUID()}"
+        try {
+            session.rpc("status.snapshot", JsonObject(), operationId)
+            fail("The isolated fault proxy did not discard the response")
+        } catch (error: HubSessionException) {
+            assertEquals("NETWORK_ERROR", error.errorCode)
+        }
+        val status = session.getStatus()
+        val pending = pendingSnapshot()
+        assertEquals(operationId, status.get("pendingOperationId").asString)
+        assertEquals(operationId, pending.get("operationId").asString)
+        assertEquals(sequence, pending.get("sequence").asLong)
+        assertEquals(sequence + 1, status.get("nextSequence").asLong)
+        assertTrue(pending.get("packetJson").asString.isNotBlank())
+        try {
+            session.rpc("status.snapshot", JsonObject())
+            fail("New operation was accepted while original ciphertext is pending")
+        } catch (error: HubSessionException) {
+            assertEquals("PENDING_RECOVERY_REQUIRED", error.errorCode)
+        }
+        publish("pending_operation_id", operationId)
+        publish("pending_request_sequence", sequence.toString())
+        publish("pending_packet_sha256", MessageDigest.getInstance("SHA-256")
+            .digest(pending.get("packetJson").asString.toByteArray(StandardCharsets.UTF_8))
+            .joinToString("") { "%02x".format(it.toInt() and 0xff) })
+    }
+
+    @Test fun faultProxyRecoverStillProcessingKeepsExactPending() {
+        val before = session.getStatus()
+        val pending = pendingSnapshot().toString()
+        try {
+            ClientHubSession(instrumentation.targetContext).recoverPending()
+            fail("Expected the pinned Hub's 409 STILL_PROCESSING")
+        } catch (error: HubSessionException) {
+            assertEquals("STILL_PROCESSING", error.errorCode)
+        }
+        val after = session.getStatus()
+        assertEquals(before.get("pendingOperationId"), after.get("pendingOperationId"))
+        assertEquals(before.get("nextSequence"), after.get("nextSequence"))
+        assertEquals(pending, pendingSnapshot().toString())
+        assertEquals("STILL_PROCESSING", after.get("sessionError").asString)
+    }
+
+    @Test fun faultProxyRecoverUncertainReconcilesWithoutSecondWrite() {
+        val before = session.getStatus()
+        val pendingId = before.get("pendingOperationId").asString
+        val next = before.get("nextSequence").asLong
+        val recovered = ClientHubSession(instrumentation.targetContext).recoverPending()
+        assertFalse(recovered.get("ok").asBoolean)
+        assertEquals("OUTCOME_UNCERTAIN", recovered.get("errorCode").asString)
+        assertEquals(pendingId, recovered.get("operationId").asString)
+        val uncertain = session.getStatus()
+        assertFalse(uncertain.has("pendingOperationId"))
+        assertEquals(next, uncertain.get("nextSequence").asLong)
+        assertTrue(uncertain.get("uncertainNeedsReconciliation").asBoolean)
+        try {
+            session.rpc("intent.submit", JsonObject())
+            fail("A second business operation was allowed before authoritative reconciliation")
+        } catch (error: HubSessionException) {
+            assertEquals("BUSINESS_RECONCILIATION_REQUIRED", error.errorCode)
+        }
+        assertTrue(session.rpc("status.snapshot", JsonObject()).get("ok").asBoolean)
+        assertFalse(session.getStatus().get("uncertainNeedsReconciliation").asBoolean)
+    }
+
+    @Test fun faultProxyRecoverUnavailableFencesOriginalPacket() {
+        val before = session.getStatus()
+        val pending = pendingSnapshot().toString()
+        try {
+            ClientHubSession(instrumentation.targetContext).recoverPending()
+            fail("Expected 409 RECOVERY_UNAVAILABLE for the legacy isolated request")
+        } catch (error: HubSessionException) {
+            assertEquals("RECOVERY_UNAVAILABLE", error.errorCode)
+        }
+        val after = session.getStatus()
+        assertEquals(before.get("pendingOperationId"), after.get("pendingOperationId"))
+        assertEquals(before.get("nextSequence"), after.get("nextSequence"))
+        assertEquals(pending, pendingSnapshot().toString())
+        assertTrue(after.get("recoveryBlocked").asBoolean)
+        try {
+            session.rpc("status.snapshot", JsonObject())
+            fail("Another operation was allowed despite unavailable recovery")
+        } catch (error: HubSessionException) {
+            assertEquals("PENDING_RECOVERY_REQUIRED", error.errorCode)
+        }
     }
 
     @Test fun offlineLeavesExactPending() {

@@ -1,62 +1,190 @@
-# CICADA 核心团队交接：Client ↔ 固定 Hub v1.2
+# Handoff: CICADA Client ↔ fixed Hub `client-hub-v1.2.1`
 
-**交接日期：**2026-09-25
+**Date:** 2026-09-26
 
-**Client 实现提交：**`3c2d8e14457d10aaf9b88bbe56215e2c10ff856a`（`dev/react-native`）
+**Client branch:** `dev/react-native`
 
-**验收依据：**[固定镜像联合验收](client-hub-v1.2-41beaf0-validation.md)
+**Node/Codex E2E candidate commit:** `09ecfe761811ceaf37e6deea2842b8a3949dfa46`
 
-## 固定基线
+**Group verifier fix commit:** `af3ad451e29d0c43142b3fc792272bbd6df75c84`
 
-| 项目 | 固定值 |
+**Final Group implementation commit:** `b676668e33c876c0d2c89bc3495fbd0d1e128c82`
+
+**Validation record:** [v1.2.1 fixed-image validation](client-hub-v1.2.1-967dbd-validation.md)
+
+**Two-Owner authorization implementation:** `680fac2bf12c431ac02804e5db168669cf12941f`
+
+**Separate authorization record:** [Two-Owner fixed-image validation](client-two-owner-v1.2.1-967dbd-validation.md)
+
+## Fixed integration baseline
+
+| Item | Value |
 |---|---|
-| Hub 源提交 | `41beaf0fa57e8279ad993fa4ce070a33515851ba`；`source_dirty=false` |
-| 协议包 SHA-256 | `e42cdca3d9f2b8719179476e2e7e87a2a9793c8c5b2a8352331928f882d18d5d` |
-| catalog SHA-256 | `613084ee67f75d27762ddaf59ec2e5b33ebea7383cbfcf455a50b472e756c66a` |
-| 完整 Hub 镜像 ID | `sha256:528dc6817a35a37c1c028dce85243afb3a7e42b4b04ed9410bd68046ef7d67e8` |
-| Client debug APK / AndroidTest APK SHA-256 | `65eff9c51f4c0b9416b36b1d96fac458ac6980f06fd9798e93350c8b60251d19` / `f6fd23ef9a64a054fdf6b19cced0de4b6a202e1eea5312e5a283f95b66b2b847` |
+| Hub source commit | `967dbd885fae9a150b3d9a77c8e4e30da1d0dd8a` (`source_dirty=false`) |
+| Protocol | `client-hub-v1.2.1` |
+| Protocol archive SHA-256 | `7bf1e3702eadf9fc3ffd50a0e8ab1213db0844b2bf418b577b88ba239216bf8a` |
+| Catalog SHA-256 | `25c3d7f585b1811781cb46669a09e2e08ab8c58765a7b9318145cea5bbce4df9` |
+| Full local image ID | `sha256:adca1c62db5747625141be4506c4f3713368260076c50876776b4dabafa6c1b7` |
+| Recovery/lost-response candidate debug APK SHA-256 | `e75e994608e12b223fb3cb041cf1d3fba1d10411e519a317c4afc25e5c94fed3` |
+| Recovery/lost-response candidate AndroidTest APK SHA-256 | `ad8bfa8c8b914677194f1cf493153eaaff67c817fc277d299b0a998a028456b8` |
+| Pre-RFC3339Nano-fix Group/E2E candidate debug APK SHA-256 | `70423555e96381722d1bdc46633d32c0fca6dc32edae4dfb45865abc1059d197` |
+| Pre-RFC3339Nano-fix Group/E2E candidate AndroidTest APK SHA-256 | `50756de57eb0ef2d9ca55feab6222d78bc4849ddf68b203560138918ba8f7c7f` |
+| Corrected Group verifier debug APK SHA-256 | `2762a2defd13a0d85bc9a7c96647cbe626f632314ac958d4d1fe689ebd346b76` |
+| Corrected Group verifier AndroidTest APK SHA-256 | `711e00f9fee11582c81af14e5a2c9d77799412166a8a3cd7008ec7cb16d27ab0` |
+| Final live Group acceptance debug APK SHA-256 | `cfe345272f2399cbed7cd76f47e25e3e6fc09ed94daadb1d6e1a6ba9106caff1` |
+| Final live Group acceptance AndroidTest APK SHA-256 | `52e9e678666654d57bd127b5f616a3094e9a9925b9fe5b960632c7cb81d6f9d5` |
 
-Client 只修改 `~/CICADA_CLIENT`，没有在手机保存 Hub/Node bearer、读取或直接修改 Hub 数据库，也没有使用旧 `/v1` 管理接口。Hub 用完整 image ID 和一次性隔离状态启动；管理 Owner 测试公钥仅经正式 CLI 登记。原始测试材料、Node 凭据及模型凭据均位于 Git 外权限受限目录。
+The APKs are candidate debug/test artifacts, not signed release packages. Protocol package, manifest, and image-label checks passed. The imported files are under [`contracts/client-hub-v1.2.1-967dbd`](../contracts/client-hub-v1.2.1-967dbd/manifest.json).
 
-## 已完成的 Client 联调
+## Two-Owner authorization acceptance — 2026-09-26
 
-- 独立 Kotlin 公开双向向量 `OK (5 tests)`，固定包、镜像标签和 Android 加密 `session.capabilities` 的合同、catalog、manager 角色相互一致。
-- 固定镜像上登记 201 响应丢失后原 Grant 重发，以及加密 RPC 200 响应丢失后原包 `/v2/client/rpc/recover`，各 `OK (1 test)`；未创建替代 operation 或推测响应序号。
-- Android 模拟器通过加密 `nodes.preview/confirm` 绑定真实 Node Agent；加密 `intent.submit` 启动有界 Goal；`gpt-5.6-luna` 的真实原生 Codex turn 请求审批；Android 以 `approvals.list/decide` 明确接受；同一 Worker attempt 1 完成。Android 所见审批 `threadId` 与 Node 认证结果 `thread_id` 的 SHA-256 一致；Android 经 `intent.status` 与 `goal.result(intent_id)` 读取 Intent `resolved`、Goal/Worker `completed`。脱敏证据见当前验收报告。
-- `group.key_manifest/grant/status` 与 `link.key_*` 仍在 Android 原生 allowlist 之外。`status_events=false` 和 `external_thread_links=false` 时继续分别使用部分变化加快照，以及仅展示跨用户提案。
+The separate two-Owner slice is **PASS** on implementation commit
+`680fac2bf12c431ac02804e5db168669cf12941f`. It uses the same clean fixed Hub
+commit, archive, catalog and complete image ID above. It adds only disposable
+fixture and Android instrumentation code. The existing UI, local STT and
+production cryptographic checks were preserved. No Monitor operations or
+new contract version were introduced.
 
-## 需要核心继续交付
+The final fresh-run evidence root is
+`/gpu1-share/data/cicada-client/two-owner-20260926T024036Z-cto-9uslracc/evidence`
+(`E2` below). Its debug APK SHA-256 is
+`cfe345272f2399cbed7cd76f47e25e3e6fc09ed94daadb1d6e1a6ba9106caff1`;
+its AndroidTest APK SHA-256 is
+`342845155edf0333e3b81aa736d25945e8d83554a61c26fc1bf438c314d26ae0`.
+The app artifact is unchanged from the final one-Owner Group run; this
+authorization result comes from new execution with a different test APK.
 
-1. **Endpoint attestation 签名字节合同（BLOCKED）。**固定 wire 文档要求签名原文省略 `signature`，固定 Go 实现签入 `"signature":null`。请统一 Hub、Node、wire、OpenAPI 与公开完整合成向量，交付原始 attestation 字节、SHA-256、ML-DSA-65 签名及完整公钥、所有 Endpoint/Principal/Node/SessionBinding ID 与 epoch、revision、binding 和 manifest digest。Client 完整独立验签前不会签 `group.key_grant`。请求、复现及门槛见[接口请求](hub-interface-requests-v12.md)。
-2. **运行镜像的确定性恢复故障驱动（NOT_RUN）。**请分别提供在一次性隔离 Hub 上安全、可复跑地触发原包 `/recover` 的 409 `STILL_PROCESSING`、重启后的签名密文 `OUTCOME_UNCERTAIN`、旧请求 409 `RECOVERY_UNAVAILABLE` 的命令、准备状态、清理步骤、预期 HTTP/密文证据及新固定镜像 ID。不得要求 Android 读取或直接改 Hub 数据库，也不要在生产 RPC 增加故障开关。Client 将核对 pending 原包、计数、阻断和权威状态对账。
-3. **独立设备与公网部署验收（NOT_RUN）。**本轮使用 Android 35 模拟器及回环 Hub；物理 Android 设备、HTTPS 证书/网络与真机密钥边界未验收。需要后续环境与独立记录，不可沿用模拟器结论。
+For the commands below, `F=/tmp/cto.9uslracc` was the disposable fixture,
+now removed, and `A=python3 scripts/interop/two-owner-android.py`.
+The [complete authorization report](client-two-owner-v1.2.1-967dbd-validation.md)
+contains exact commands, failures from the initial development attempt,
+image/helper provenance and evidence limits.
 
-## 可交给 CICADA 核心开发者的提示词
+| Check | Result | Command and exit | Evidence under `E2` |
+|---|---|---|---|
+| Clean fixed target and package verification | **PASS** | `python3 scripts/interop/two-owner-fixture.py prepare`: 0; nested contract verifier: 0 | `fixed-target.json`, `verify-contract.log`, `runtime-provenance.json`, `fixture-commands.jsonl` |
+| Independent Android device keys A, A-admin and B | **PASS** | `$A "$F" test prepareTwoOwnerDeviceKeys`: runner 0, ADB 0, `OK (1 test)` | `prepareTwoOwnerDeviceKeys.json` |
+| Owner-bound encrypted capabilities, Node confirmations and separate Groups | **PASS** | `$A "$F" test enrollConfirmAndCreateOwnerGroups`: runner 0, ADB 0, `OK (1 test)`; four reviewed taps: 0 | `enrollConfirmAndCreateOwnerGroups.json`, `reviewed-taps.json` |
+| Live manifests, complete Android proof verification and external Owner signatures | **PASS** | `$A "$F" test exportOwnerGroupManifests`: runner 0, ADB 0, `OK (1 test)`; `sign-groups "$F"` through fixture driver: 0 | `exportOwnerGroupManifests.json`, `fixture-commands.jsonl` |
+| Both own grants `CURRENT`; six cross-Owner requests denied; tampered proof rejected at Hub | **PASS** | `$A "$F" test twoOwnerOwnershipAndRevocationMatrix`: runner 0, ADB 0, `OK (1 test)`; two reviewed grant taps: 0 | `twoOwnerOwnershipAndRevocationMatrix.json`, `summary.redacted.json`, `reviewed-taps.json` |
+| Local pending/identity isolation, authoritative grant records unchanged, revoke A while B remains usable | **PASS** | Same matrix command: 0; includes fresh A request and exact old packet `/rpc` and `/recover` HTTP 403 | `summary.redacted.json`, matrix private log |
+| Known-secret checks and cleanup | **PASS** | Local evidence scan: 0; `python3 scripts/interop/two-owner-fixture.py stop "$F"`: 0 | `privacy-check.redacted.json`, `teardown.json` |
+| New native Codex/Thread run; physical Android; public HTTPS | **NOT_RUN** | No commands for these gates in this slice | Earlier native evidence remains separately attributed |
 
-> 你只负责 `~/CICADA`。先检查工作树与固定提交
-> `41beaf0fa57e8279ad993fa4ce070a33515851ba` 的协议包、路由和镜像；
-> 不修改 `~/CICADA_CLIENT`。
->
-> Client 实现提交为 `3c2d8e14457d10aaf9b88bbe56215e2c10ff856a`。
-> 固定 Hub image ID 为
-> `sha256:528dc6817a35a37c1c028dce85243afb3a7e42b4b04ed9410bd68046ef7d67e8`。
-> Android 模拟器已通过加密 Hub 与真实 Node Agent、`gpt-5.6-luna`
-> 原生 Codex 完成审批闭环；同一 Worker attempt/Thread 继续并经 `goal.result`
-> 读取完成。登记 201 与 RPC 200 响应丢失亦已通过。请保留这些证据边界。
->
-> 现在请完成两项交付：
->
-> 1. 统一 `EndpointKeyAttestation` 的精确 ML-DSA-65 签名原文。
->    当前 wire 排除 `signature`，固定 Go 实现签入 `"signature":null`。
->    提供完整公开合成向量、原始 attestation 字节、签名和公钥，以及所有
->    ID、epoch、revision、binding 与 manifest digest 的可独立验证证据。
-> 2. 提供只在一次性隔离镜像使用的安全故障驱动，确定性触发
->    `/v2/client/rpc/recover` 的 `STILL_PROCESSING`、Hub 重启后的签名密文
->    `OUTCOME_UNCERTAIN` 和旧请求 `RECOVERY_UNAVAILABLE`。附准备、执行、
->    清理命令及预期 HTTP/密文证据。
->
-> 不要让 Client 读取或直接修改 Hub 数据库、持有 Hub/Node bearer，或调用
-> 旧 `/v1`；不要在生产 API 添加故障开关。每项交付干净 commit、协议包及
-> catalog SHA-256、完整镜像 ID、`source_dirty`、测试命令/退出码和脱敏证据。
-> 参考 `~/CICADA_CLIENT/docs/client-hub-v1.2-41beaf0-validation.md` 与
-> `~/CICADA_CLIENT/docs/hub-interface-requests-v12.md`。
+No required item in this two-Owner slice remains **BLOCKED**. The Hub negative
+cases used each other Owner's real existing Group, Endpoint and valid Owner
+proof. All six requests returned HTTP 200 with a verified encrypted
+`permission denied` business result. The separate corrupted-signature request
+reached the Hub verifier and returned a signature rejection. These are distinct
+from the product's local preflight errors and the HTTP 403 responses after
+revocation. The authenticated negative requests legitimately advance Hub
+request/response counters; unchanged state refers to target grants and isolated
+Client journals, not an unchanged Hub request ledger.
+
+These Endpoints are explicitly **synthetic authorization fixtures**, not native
+sessions. The three Android contexts have independent PQ identities and journals
+but share one emulator app UID and Keystore wrapping alias. The wrong-device
+response-open assertion rejects a route/recipient mismatch; it is not a separate
+OS key-isolation or KEM-decapsulation experiment. Owner/Endpoint private keys and
+Node bearers stayed outside Android. Both runs' disposable Hub/Node/emulator
+state and credentials were removed. Nothing was pushed, merged or deployed.
+
+## Earlier evidence on this fixed target
+
+- An independent Android session completed encrypted `session.capabilities` against the fixed image.
+- Exact enrollment Grant replay after a lost HTTP 201 and exact encrypted RPC recovery after a lost HTTP 200 passed. The Android tests each returned `OK (1 test)` and ADB exit 0; the proxy evidence records the upstream response before dropping the downstream response.
+- All three Android recovery fault tests passed with a new disposable Hub under `/tmp`. Each scenario script exited 0 and each final Android test returned `OK (1 test)` with ADB exit 0. For the uncertain outcome, the test waited for `FAULT_READY`, restarted only the disposable Hub, then recovered the signed encrypted notice. The details and Git-external evidence paths are in the validation report.
+- Candidate APK `70423555e96381722d1bdc46633d32c0fca6dc32edae4dfb45865abc1059d197` passed `EndpointAttestationVectorTest` (`OK (4 tests)`, ADB exit 0), covering the full Endpoint proof, synthetic manifest digests, and owner proof. Subsequent review found that this candidate rejects valid RFC3339Nano timestamps with four fractional digits.
+- The fix in commit `af3ad451e29d0c43142b3fc792272bbd6df75c84` passed `./scripts/docker-build-android-test.sh` (exit 0) and `EndpointAttestationVectorTest` on `emulator-5554` (`OK (4 tests)`, ADB exit 0), producing corrected APKs `2762a2…` and `711e00…` above.
+- Candidate APK/test pair `7042…`/`5075…` passed `ClientWirePublicVectorTest` (`OK (5 tests)`) and `ClientHubRecoveryLockTest` (`OK (3 tests)`), each ADB exit 0 on `emulator-5554`.
+- On the `7042…` APK, E2E setup `enrollAndRead` passed against the Hub on port 8794 (`OK (1 test)`, ADB exit 0), verifying encrypted capabilities and status. A fresh `cicada machine agent --once` reached the expected pending-device-code state before confirmation; Android `confirmDisposableNodeForQueuedGoal` verified the previewed Node ID and encrypted `nodes.confirm` (`OK (1 test)`, ADB exit 0). Its device code stayed in an external `0600` file.
+- The completed native E2E accepted one real Codex approval on the original Thread and Worker attempt 1. The Worker and Goal completed, Intent resolved, and `goal.result` was present and byte-matched the 30-byte Node result. The exact runner commands, exits, redacted IDs and digests are in the validation report. This run used `7042…`, so it does not exercise the corrected Group timestamp verifier in `2762…`.
+- E2E cleanup removed the proxy, temporary Node/Codex state, wrapper, device code, and test marker; the one-time Codex container used `--rm`. The provider environment was mounted read-only only into that isolated Codex container, and no bearer or secret entered the Node process, APK, repository, or logs. The disposable Hub was stopped and removed; other Hub containers were left untouched. Sanitized evidence remains outside Git with restricted permissions.
+- The later disposable Group fixture supplied a real native Codex Endpoint. Android validated the full manifest, imported an externally signed `signed_proof`, required an explicit on-device confirmation, and read encrypted `group.key_status=CURRENT` on final implementation commit `b676668e33c876c0d2c89bc3495fbd0d1e128c82`. The Owner private key stayed outside the APK. Exact APK hashes, commands and limits are in the [Group key acceptance report](client-group-key-v1.2.1-disposable-validation.md).
+- The Android builds passed; build logs and exact commands/exits are in the validation report. The independent loss/recovery tests used the earlier candidate artifacts listed above. The candidate with the timestamp issue is not called final for Group-key validation.
+
+## Final Group acceptance: result and evidence index
+
+All rows below use the fixed Hub image in the baseline table and the final Group APK pair above. Let `E=/gpu1-share/data/cicada-client/group-key-v121-967dbd/evidence`; this directory is `0700`, its evidence files are `0600`, and its raw IDs, signed public proofs and logs are outside Git. Arguments containing IDs, one-time codes or proofs are omitted from the command column. The [full Group report](client-group-key-v1.2.1-disposable-validation.md) records the test order, hashed Endpoint/Session/Group/Node/binding labels, command exits and limits. It does not turn earlier `7042…` or `2762…` results into final-APK evidence.
+
+| Check | Result | Command and exit code | Evidence under `$E` |
+|---|---|---|---|
+| Archive, clean source, exact image and encrypted capabilities | **PASS** | `python3 ../CICADA/scripts/client-contract.py verify <fixed archive>`: 0; `docker image inspect <full image ID>`: 0; `python3 "$E/run-android-test.py" "$E/external-capabilities.spec.json"`: 0, JUnit `OK (1 test)` | `fixed-target-provenance.json`, `external-capabilities.log` |
+| Android device preparation, owner-signed enrollment and Node/Group setup | **PASS**, with the failed combined harness attempt below | `python3 "$E/run-android-test.py" "$E/prepare-device.spec.json"`: 0; `python3 "$E/run-android-test.py" "$E/reconcile-group.spec.json"`: 0, JUnit `OK (1 test)`; reviewed on-screen taps: 0 | `prepare-device.log`, `device-signer.private.log`, `external-capabilities.log`, `reconcile-group.log`, `confirm-node-after.private.log` |
+| Real native Codex Join, separate candidate publication, complete Android manifest verification and external Owner signing | **PASS** | `python3 "$E/rapid-prepare-grant.py" finalui`: 0; embedded manifest instrumentation: 0, JUnit `OK (1 test)` | `codex-finalui.private.jsonl`, `native-finalui.private.json`, `manifest-finalui.log`, `group-signer-finalui.private.log` |
+| Phone confirmation, encrypted `group.key_grant`, separate encrypted `group.key_status=CURRENT` | **PASS** | `python3 "$E/run-android-test.py" "$E/grant-finalui.spec.json"`: 0, JUnit `OK (1 test)`; reviewed on-screen tap: 0 | `grant-finalui.log`, `grant-finalui-dialog.private.png`, `grant-finalui.private.json` |
+| Mutated Owner signature and wrong Owner key selection; nonexistent Group/Endpoint scope | **PASS**, limited to Client-side rejection and encrypted Hub business rejections | `python3 "$E/run-android-test.py" "$E/reject-tampered-proof-finalui.spec.json"`: 0; `python3 "$E/run-android-test.py" "$E/reject-wrong-scope.spec.json"`: 0; each JUnit `OK (1 test)` | `reject-tampered-proof-finalui.log`, `reject-wrong-scope.log` |
+| Accepted grant after native lease expiry, then proof expiry | **PASS**: `STALE`, then `PROOF_EXPIRED` | `python3 "$E/run-android-test.py" "$E/status-stale-finalui.spec.json"`: 0; `python3 "$E/run-android-test.py" "$E/status-proof-expired-finalui.spec.json"`: 0; each JUnit `OK (1 test)` | `status-stale-finalui.log`, `status-proof-expired-finalui.log` |
+| Early manager-role assertion and combined Node preview/Group runner | **FAIL** as harness attempts, not final protocol results | `python3 "$E/run-android-test.py" "$E/enroll-and-capabilities.spec.json"`: runner 1, ADB 0, JUnit `FAILURES!!!`; `python3 "$E/run-android-test.py" "$E/confirm-node-create-group.spec.json"`: runner 1, ADB 0, JUnit `FAILURES!!!` | `enroll-and-capabilities.log`, `confirm-node-create-group.log`; the code-bearing second spec was deleted at teardown; corrected external-role and Group runs above |
+| Independent Hub submission of a tampered grant; second real Owner cross-owner authorization | **NOT_RUN** | No qualifying command; the Client fenced the tampered proof and the fixture enrolled only one Owner | No claim of server-side tamper or two-Owner rejection |
+| Physical Android hardware; public HTTPS | **NOT_RUN** | No command run | Emulator loopback evidence does not establish either environment |
+
+No item remains **BLOCKED** for the one-Owner positive path. The initial long Node state path blocked the Unix Join socket, but a short real private `/tmp` state directory enabled the final PASS; the fixture improvement request is below. The disposable Hub/Node, short state directory, ADB reverse mapping and emulator app data were removed with exit 0. The synthetic Node code briefly appeared in a transient process-inspection output; it expired and its private spec was deleted. The full report records that privacy finding and the evidence metadata class-name correction.
+
+## Contract correction and outstanding validation
+
+The previous `41beaf0` v1.2 report recorded a mismatch between the prose and Go implementation for `EndpointKeyAttestation` v1: the implementation signs compact JSON with a final `"signature":null` field. The fixed v1.2.1 wire contract documents those exact bytes and the bundle contains a public synthetic vector. This closes the published contract ambiguity. Candidate `70423555…` failed a valid four-digit RFC3339Nano fraction check; commit `af3ad451e29d0c43142b3fc792272bbd6df75c84` fixes it. The later disposable Group run on the same fixed image independently established the live positive path with a different final APK pair; the earlier Node/Codex and vector APKs are not counted as its proof.
+
+The real Node/Codex approval run is **PASS** for this fixed image, as described above. The E2E topology snapshot/Endpoint group-membership probe, physical Android hardware, and public HTTPS are **NOT_RUN**. The earlier `41beaf0` result remains historical and is not the evidence used for this pass.
+
+The first attempt to run the recovery fixture from a `/gpu1` working directory failed with HTTP 502 because the fixture requires a real `/tmp` root. The corrected disposable `/tmp` run passed. Both results are recorded as such; the failed attempt is not counted as a protocol failure or a PASS.
+
+## Security and environment boundary
+
+All current Hub tests used an isolated disposable state. No Android Client stores Hub or Node bearer credentials or reads the Hub database. Sensitive test material and raw logs stay outside Git under `/gpu1-share/data/cicada-client/hub-v1.2.1-967dbd/`; the report names only the required evidence paths. The Client uses independently pinned Hub identity, an owner-signed device Grant, encrypted `session.capabilities`, and encrypted `/v2/client/rpc`. It does not call legacy `/v1` bearer APIs.
+
+This integration validates Client-to-Control management encryption. It does not prove ordinary peer messages are unreadable to the Hub. The fixed contract keeps `status_events=false` and `external_thread_links=false`; cross-user links remain proposals, not routable Threads. No real-device key boundary or public HTTPS conclusion follows from emulator results.
+
+## Next actions
+
+1. Preserve the fixed-image Group acceptance and original Node/Codex approval traces as separate evidence sets. The Group result uses APK `cfe34527…` and native Codex candidate publishing; the earlier Goal approval result uses APK `70423555…` and exercises a different path.
+2. Use the separate two-Owner report above for cross-Owner authorization and Hub-side signature rejection. That gap is now closed for the fixed image with synthetic Endpoints; it does not replace native Thread evidence.
+3. Run physical-device key/Keystore and public HTTPS tests before making deployment claims. Both remain **NOT_RUN**.
+
+## Core fixture feedback
+
+The core-side `client-group-key-fixture.sh` and its recipe enabled the positive acceptance without new production routes. One operational issue arose: its long `/tmp/cicada-client-group-key.*` directory plus long synthetic Node ID exceeded the Unix-domain Join socket path limit. The Node Agent exited before Join. A short symlink allowed the socket but was correctly rejected by Node-local Endpoint key storage, which requires a real directory. The Client run copied only this disposable Node state into a private short real `/tmp` directory and then completed the test; both state locations were removed during teardown. Please make the fixture allocate a sufficiently short **real** Node state path and document the same-path MCP settings. This is fixture ergonomics, not evidence of a fixed-image protocol change.
+
+The synthetic Owner's encrypted `session.capabilities` role was `external`, with Group and topology operations in its allowlist. The Client's legacy manager-role enrollment assertion failed after successful enrollment; a separate external-role encrypted capabilities test passed. The core fixture documentation should state that role explicitly so a future runner does not mistake the expected role for a Hub fault.
+
+### Copyable prompt for the CICADA core maintainer
+
+```text
+You own only the CICADA core repository. Do not edit CICADA_CLIENT or modify
+production Hub state.
+
+Fixed acceptance target (already tested):
+- source commit: 967dbd885fae9a150b3d9a77c8e4e30da1d0dd8a
+- contract: client-hub-v1.2.1
+- protocol archive SHA-256: 7bf1e3702eadf9fc3ffd50a0e8ab1213db0844b2bf418b577b88ba239216bf8a
+- catalog SHA-256: 25c3d7f585b1811781cb46669a09e2e08ab8c58765a7b9318145cea5bbce4df9
+- image ID: sha256:adca1c62db5747625141be4506c4f3713368260076c50876776b4dabafa6c1b7
+- Native Group implementation commit: b676668e33c876c0d2c89bc3495fbd0d1e128c82
+- Two-Owner instrumentation/fixture commit: 680fac2bf12c431ac02804e5db168669cf12941f
+- Native Group report: CICADA_CLIENT/docs/client-group-key-v1.2.1-disposable-validation.md
+- Authorization report: CICADA_CLIENT/docs/client-two-owner-v1.2.1-967dbd-validation.md
+
+The one-Owner disposable fixture succeeded: Android encrypted manifest,
+independent full Endpoint verification, external Owner signing, explicit phone
+confirmation, encrypted grant and status CURRENT. The same grant became STALE
+after the native binding lease expired and PROOF_EXPIRED after the proof expired;
+the Android Client rejected a mutated Owner signature before submission.
+The later two-Owner authorization run also passed with synthetic Endpoints:
+both own grants CURRENT; A-to-B and B-to-A manifest/status/grant denied inside
+authenticated encrypted responses; a corrupted public signature rejected by
+the Hub; revoked A new requests and original-packet RPC/recover rejected with
+HTTP 403, while B remained usable. It does not repeat native Thread acceptance.
+
+Read the reports and working tree read-only. Review the fixed identities,
+exact APK attribution, command exits, redacted summaries and teardown records.
+The first development attempt's compile and canonical-input failures are
+retained separately from the successful final fresh run. No core interface
+gap remains for this authorization slice; do not request another replacement
+fixture or expand Client to unshipped Monitor operations. Preserve the fixed
+image and contract; a new Hub build needs a clean commit and complete
+archive/catalog/image identity before new acceptance.
+
+Do not put Owner private keys or Node bearers in Android, Git or logs, and do
+not inspect or mutate a live Hub database. Physical Android and public HTTPS
+remain NOT_RUN until independently tested.
+```

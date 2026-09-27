@@ -23,17 +23,18 @@ export type ClientRpcOperation =
   | 'link.list'
   | 'link.invite_create'
   | 'link.invite_preview'
-  | 'link.invite_accept';
+  | 'link.invite_accept'
+  | 'group.key_manifest'
+  | 'group.key_grant'
+  | 'group.key_status';
 
-// Key grant operations remain advertised separately until canonical manifests
-// and Endpoint attestations have a native verifier.
+// Link key consent remains unavailable until its separate contract is verified.
 export type ClientHubAdvertisedOperation = ClientRpcOperation |
-  'link.key_manifest' | 'link.key_grants' | 'link.key_grant' |
-  'group.key_manifest' | 'group.key_grant' | 'group.key_status';
+  'link.key_manifest' | 'link.key_grants' | 'link.key_grant';
 
 export interface ClientHubCapabilities {
   contract: string;
-  contract_revision: 'client-hub-v1.2';
+  contract_revision: 'client-hub-v1.2.1';
   catalog_sha256: string;
   status: 'partial' | 'not_ready' | string;
   planned_platform: string;
@@ -128,7 +129,7 @@ export interface ClientGoalResult {
 export interface ClientHubSessionCapabilities {
   owner_id: string;
   role: 'manager' | 'external' | string;
-  contract_revision: 'client-hub-v1.2';
+  contract_revision: 'client-hub-v1.2.1';
   catalog_sha256: string;
   available_rpc_operations: ClientHubAdvertisedOperation[];
 }
@@ -212,11 +213,22 @@ export interface ClientHubNativeBridge {
   }): Promise<unknown>;
   recoverPending(): Promise<unknown>;
   retryPendingExact(): Promise<unknown>;
+  previewGroupKey(input: {groupId: string; endpointId: string; ownerKeyId: string}): Promise<{
+    ok: boolean; verified: true; result: Record<string, unknown>;
+  }>;
+  grantGroupKey(input: {groupId: string; endpointId: string; ownerKeyId: string;
+    expectedDigest: string; signedProofBase64: string}): Promise<unknown>;
+  getGroupKeyStatus(input: {groupId: string; endpointId: string}): Promise<{
+    ok: boolean; result?: Record<string, unknown>;
+  }>;
 }
 
-export interface ClientHubApi extends Omit<ClientHubNativeBridge, 'getStatus'> {
+export interface ClientHubApi extends Omit<ClientHubNativeBridge, 'getStatus' | 'getGroupKeyStatus'> {
   getStatus(): Promise<ClientHubStatus>;
   goalResult(input: ClientGoalResultRequest): Promise<ClientGoalResult>;
+  groupKeyStatus(input: {groupId: string; endpointId: string}): Promise<{
+    ok: boolean; result?: Record<string, unknown>;
+  }>;
 }
 
 const native = NativeModules.CicadaClientHub as ClientHubNativeBridge | undefined;
@@ -243,6 +255,7 @@ const operationNames: ClientRpcOperation[] = [
   'approvals.decide', 'intent.get', 'intent.status', 'intent.list', 'intent.submit',
   'link.list',
   'link.invite_create', 'link.invite_preview', 'link.invite_accept',
+  'group.key_manifest', 'group.key_grant', 'group.key_status',
 ];
 const isRpcOperation = (value: string): value is ClientRpcOperation =>
   operationNames.includes(value as ClientRpcOperation);
@@ -277,6 +290,9 @@ export const clientHub: ClientHubApi = Platform.OS === 'android' && native ? {
   rpc: input => native.rpc(input),
   recoverPending: () => native.recoverPending(),
   retryPendingExact: () => native.retryPendingExact(),
+  previewGroupKey: input => native.previewGroupKey(input),
+  grantGroupKey: input => native.grantGroupKey(input),
+  groupKeyStatus: input => native.getGroupKeyStatus(input),
 } : {
   getStatus: async () => unavailableStatus,
   fetchHubMetadata: () => unavailable(),
@@ -289,6 +305,9 @@ export const clientHub: ClientHubApi = Platform.OS === 'android' && native ? {
   rpc: () => unavailable(),
   recoverPending: () => unavailable(),
   retryPendingExact: () => unavailable(),
+  previewGroupKey: () => unavailable(),
+  grantGroupKey: () => unavailable(),
+  groupKeyStatus: () => unavailable(),
 };
 
 export function operationAllowed(
@@ -298,7 +317,7 @@ export function operationAllowed(
   if (status.uncertainNeedsReconciliation && [
     'goal.lifecycle', 'topology.apply', 'devices.revoke', 'nodes.confirm',
     'nodes.revoke', 'approvals.decide', 'intent.submit', 'link.invite_create',
-    'link.invite_accept',
+    'link.invite_accept', 'group.key_grant',
   ].includes(operation)) return false;
   return status.nativeAvailable && status.remoteEnabled &&
     status.sessionCapabilitiesReady && !status.pendingOperationId &&

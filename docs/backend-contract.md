@@ -1,40 +1,83 @@
-# Client ↔ Hub v1.2：已实现的服务端契约（2026-09-25）
+# Android Client ↔ Hub contract: `client-hub-v1.2.1`
 
-来源：核心仓库干净提交 `41beaf0fa57e8279ad993fa4ce070a33515851ba` 导出的 [固定协议包](../contracts/README.md)，并核对实际路由和测试。核心服务端是权威定义；本仓库不链接 Go 核心，也不调用旧 `/v1` 管理 bearer API。固定镜像 ID 为 `sha256:528dc6817a35a37c1c028dce85243afb3a7e42b4b04ed9410bd68046ef7d67e8`；一次性隔离 Hub 在 `127.0.0.1:8794`，模拟器使用 `10.0.2.2:8794`；生产仅允许 HTTPS 和独立核验的 Hub 身份。历史镜像和旧验收不能证明本次固定版本。
+**Last updated:** 2026-09-25
 
-| 步骤 | 真实接口 | Android 用法与边界 |
-|---|---|---|
-| 公共能力 | `GET /v2/client/capabilities` | 核对 `contract_revision=client-hub-v1.2` 和 catalog `613084ee67f75d27762ddaf59ec2e5b33ebea7383cbfcf455a50b472e756c66a`；这只表示 Hub 实现能力，不授予设备权限。`status_events=false`、`external_thread_links=false` 时隐藏推送和跨用户消息入口。 |
-| 固定身份 | `GET /v2/client/identity` | 用户从独立可信渠道提供完整 `hub_id` 与 Control 公钥；App 校验公钥 ID 并逐字节比较，绝不自动信任首次 HTTP 返回。 |
-| 设备登记 | `POST /v2/client/devices/enroll` | 手机生成 ML-KEM-768/ML-DSA-65 密钥；owner 独立签署绑定 Hub/设备/密钥/时限/nonce 的 `OwnerDeviceGrant`。App 在首次 POST 前持久保存完整原始请求；201 响应丢失时，仅原样重发该请求，并核对返回的 owner、device、epoch 和 key version。无手机端自我批准或 bearer 捷径。 |
-| 敏感读写 | `POST /v2/client/rpc`、`POST /v2/client/rpc/recover` | 所有业务请求使用精确 Client-Control v1 route/AAD、ML-KEM、ML-DSA、HKDF、AES-GCM。持久保存序号、预期响应序号和原始签名密文包；响应丢失先用 `/recover` 查原包。`COMPLETED` 返回同一密文；`STILL_PROCESSING` 保留 pending；`OUTCOME_UNCERTAIN` 验签后退休传输 pending 但保留不确定业务证据，并要求权威快照对账；`RECOVERY_UNAVAILABLE` 不猜序号或重发；`RECOVERY_REJECTED` 仅允许用户明确选择原包重试。HTTP 200 内仍可能是加密业务拒绝。 |
-| 会话授权 | 加密 `session.capabilities` | 核对当前 owner、角色、`contract_revision`、`catalog_sha256`，再按 `available_rpc_operations` 限定设备操作；旧版本缓存授权失效。 |
-| 状态 | 加密 `status.snapshot`、`status.changes` | 快照含 Node/Endpoint/Worker/Goal/Group/Task 及来源/新鲜度；变化流是 `completeness=partial` 的持久游标，不是 push。定期快照对账，列表只缓存于内存。 |
-| 自然语言 | 加密 `intent.submit`、`intent.status`、`goal.result` | 文本或本地 STT 草稿经用户确认后提交；`intent.status` 的 `DONE` 只说明 Intent 分发完毕。Manager 会话在授权后用 `intent_id` 查询有界 `goal.result`，独立显示 Intent、Goal、Worker 终态及 Artifact 引用。 |
-| 请求历史 | 加密 `intent.list`、`intent.get`、`intent.status` | 服务端已有 owner 范围的持久 Intent 列表与详情；Android 工作页用 `intent.list` 按需读取历史，用 `intent.status` 逐条读取业务与分发进度。`intent.get` 已在 Android 互操作中验证，但 UI 无需重复调用。重新创建会话后的查询已在真实开发 Hub 测过。返回含原文/结果，只能在认证后按需读取，不写入持久缓存。当前 `intent.list` 的 Store 查询没有分页或服务端数量上限；Client 仅能按需调用并限制本机显示数，大量历史需要后端增加分页契约。 |
-| 设备管理 | 加密 `devices.list`、`devices.revoke` | 同 owner Client 设备清单和版本化撤销已接手机设置页；当前手机的撤销按钮隐藏，服务端也拒绝自撤销。真实 Docker Hub 已验证列表、业务拒绝、可丢弃设备撤销及撤权后 403；不能把 Node 绑定撤销当作 Client 设备撤销。 |
-| Goal 生命周期 | 加密 `goal.lifecycle` | 工作页仅在已知、非陈旧的远端 queued/paused Goal 且其 Worker 均已知为 queued 时提供 `pause/resume`；提交前重读权威快照并带 `expected_version`，失败后不自动重试。Android Kotlin 加密 RPC 已在真实 Docker Hub 的远端排队 Goal 上通过暂停、过期版本拒绝、恢复和 Node 不可领取验证；手机 UI 的恢复/暂停排队确认亦已实测。服务端不停止正在运行的原生 Worker。 |
-| 拓扑 | 加密 `topology.snapshot`、`topology.apply` | `group.create`、`group.set_parent`、`endpoint.join_group/leave_group`、`membership.bind_role`、同 owner `link.propose/revoke`；使用对象版本/绑定 epoch，失败重新读取权威状态。 |
-| Node 绑定 | 加密 `nodes.preview/confirm/list/revoke` | Node 本地保管 bearer，手机只输入短码；先预览核对再批准；撤销带 `expected_version`。 |
-| 审批 | 加密 `approvals.list/decide` | manager owner 才能列举和决定；`accept/decline` 只对 pending 生效。固定镜像上的 Android 模拟器已对真实远端 Node/Codex 原生审批作出决定，并核对同一 Worker attempt 与 Thread 摘要。 |
-| 跨 owner 提案与密钥同意 | 加密 `link.list`、`link.invite_create/preview/accept`；Hub 另广告 `link.key_*` | Android 管理页按 `external_link_invites` 与加密会话授权展示 owner-scoped 分页列表、一次性邀请、受限预览、明确接受和版本化撤销；所有状态均标为提案。隔离真实 Docker Hub 与两台新 Android 模拟器已通过双 Owner 的邀请→预览→接受→双方列表→版本冲突拒绝→撤销主路径；非法 token、跨 Owner source 和消费后重放亦被拒绝。`external_thread_links=false`，只展示提案。`link.key_*` 和 `group.key_*` 在 Android 原生 RPC allowlist 中禁用，直到 Client 独立校验完整合同、manifest 和 Endpoint attestation。 |
-| Group Endpoint 密钥 | 加密 `group.key_manifest/grant/status` | Hub v1.2 返回完整 `candidate_attestation`，但固定文档与 Go 签名字节不一致；Client 的可调用 allowlist 仍不包含这三项，owner 签署入口关闭。见[接口请求](hub-interface-requests-v12.md)。 |
+This document follows the imported protocol bundle at [`contracts/client-hub-v1.2.1-967dbd`](../contracts/client-hub-v1.2.1-967dbd/manifest.json). The current fixed target is:
 
-**身份区分：** Hub 文档中的 `control_public_identity.id` 是 Client→Control 加密接收方，不是 Manager Owner ID。实际开发 Hub 的 resident Owner 由 Control 自身身份决定；测试时若把接收方公钥 ID 当成 `owner_id`，加密通道仍可建立，但 `session.capabilities.role` 正确返回 `external`。界面必须只信任加密的会话能力。
+| Item | Value |
+|---|---|
+| Hub source revision | `967dbd885fae9a150b3d9a77c8e4e30da1d0dd8a` |
+| Contract revision | `client-hub-v1.2.1` |
+| Protocol archive SHA-256 | `7bf1e3702eadf9fc3ffd50a0e8ab1213db0844b2bf418b577b88ba239216bf8a` |
+| Catalog SHA-256 | `25c3d7f585b1811781cb46669a09e2e08ab8c58765a7b9318145cea5bbce4df9` |
+| Full Docker image ID | `sha256:adca1c62db5747625141be4506c4f3713368260076c50876776b4dabafa6c1b7` |
 
-**版本与证据边界（2026-09-25）：** 固定提交、镜像和包的实际验证见 [当前验收](client-hub-v1.2-41beaf0-validation.md)。核心仓库工作树可能继续前进，不能由其当前 HEAD 推断本次固定镜像。真实 Codex 已在模拟器链路验收；Android 真机与公网 HTTPS 仍需分别验收。本仓库不修改核心状态声明。
+The archive and manifest checks and image labels passed. A separate Android session verified encrypted `session.capabilities`. Results are scoped to this fixed target in the [validation report](client-hub-v1.2.1-967dbd-validation.md); the earlier `41beaf0` report is historical and does not establish behavior of this image.
 
-## 目前不开放为可用功能
+## Trust and authorization
 
-- `status_events=false`：没有完整推送，使用 `status.changes` 轮询并周期性快照对账。
-- `external_thread_links=false`：邀请和密钥同意只是提案；普通 peer 消息仍有 Hub 可见明文路径，不能展示为可聊天的跨用户连接。
-- 跨 owner 邀请 token 是一次性 bearer，最多一小时；Hub 预览不返回源 owner/Node/Endpoint/Group ID。App 只在当前内存展示创建结果，切后台清除；用户需自行通过可信渠道交给目标用户，当前没有指定目标 owner 的邀请绑定。
-- 外部 owner 会话不能调用本 Hub 的 Intent、Goal、Approval 管理操作；真实权限以加密 `session.capabilities` 为准。
-- 公网 TLS 部署、设备换机/恢复及真机麦克风性能仍需独立验收。开发 HTTP 只允许模拟器到宿主机回环映射，敏感正文仍在应用层加密。
+The current wire protocol provides `GET /v2/client/identity`, `GET /v2/client/capabilities`, `POST /v2/client/devices/enroll`, `POST /v2/client/rpc`, and `POST /v2/client/rpc/recover`. The public capabilities response describes Hub implementation support. It does not authenticate a device or grant access.
 
-## 开发顺序与验证门槛
+Before enrollment, the user independently verifies and pins the full Hub ID and Control public identity. The device generates its own ML-KEM-768 and ML-DSA-65 key pair. An independently trusted owner signs a one-time `OwnerDeviceGrant` bound to the Hub, owner, device public identity, purpose, nonce, and expiry. The Client persists the exact enrollment bytes before the first POST. If the 201 response is lost, only the same bytes may be replayed. The Client does not self-approve enrollment or use a legacy bearer shortcut.
 
-1. 独立实现 Android PQ 密钥、系统 Keystore 包装、手动可信 Hub 公钥固定、Grant 验证和登记；使用非 Go 客户端对真实 Docker Hub 通过 `session.capabilities`，核对响应签名/密文。
-2. 持久化请求序号及精确密文包；实测原包重试得到相同响应、改包重放被拒绝、设备撤销后被拒绝、断线恢复与未确定请求的权威对账。
-3. 接状态/Intent/管理 UI；成功、业务拒绝、版本冲突、撤权和断线均显示来源和恢复动作；不保留敏感请求正文到日志或长期缓存。
-4. 保持现有本地 STT 和 UI；没有会话时不发送管理数据，不用 `/v1` 降级。
+After enrollment, the first encrypted operation is `session.capabilities`. It supplies the authenticated owner, role, contract revision, catalog digest, recovery support, and operation allowlist. The Client requires both this encrypted authorization and local support for an operation. Server guards remain authoritative; no role, owner, or approval field supplied by the Client grants permission.
+
+## Encrypted RPC and recovery
+
+Every operation uses the Client-Control v1 wire framing and its exact route/AAD rules with ML-KEM-768, ML-DSA-65, HKDF, and AES-256-GCM. The device persists the request sequence, expected response sequence, operation ID, and exact signed ciphertext before sending. The server derives owner/device/epoch from the registered device and fences replayed or altered packets.
+
+The encrypted RPC catalog includes session capabilities; status snapshots and partial changes; Intent submission, lookup, and status; Goal results and lifecycle; topology; device, Node, and Approval management; Link proposals and key evidence; and Group Endpoint key operations. Actual access depends on the authenticated role and encrypted allowlist. Catalog presence alone does not make a Client UI action available.
+
+For a missing response, the Client submits the original request packet to `/v2/client/rpc/recover`. Recovery never dispatches the business operation again:
+
+| Recovery result | Client behavior |
+|---|---|
+| Completed request | Accept the original cached encrypted response. |
+| `STILL_PROCESSING` (HTTP 409) | Preserve the exact pending packet, operation ID, and sequence. Do not create another operation. |
+| Signed encrypted `OUTCOME_UNCERTAIN` | Verify the signature, original operation ID, and reserved response sequence. Retire only the transport pending slot; retain the uncertain business outcome and reconcile authoritative state. |
+| `RECOVERY_UNAVAILABLE` (HTTP 409) | Preserve the unresolved business evidence. Do not guess a response sequence or replay the operation. |
+| `RECOVERY_REJECTED` | Permit retry only as an explicit user choice and only with the original packet. |
+
+HTTP success does not imply business success. A business rejection is an authenticated encrypted result. Transport failure, Intent dispatch, Goal state, Worker execution, and model consumption remain separate states in the UI.
+
+The current v1.2.1 fixed-image Android validation passed all three deterministic recovery cases on a disposable `/tmp` Hub with an independent Android session. The exact commands and limits are in the [validation report](client-hub-v1.2.1-967dbd-validation.md#recovery-faults-on-the-disposable-fixed-image). This evidence does not authorize direct Hub database access or a production fault switch.
+
+## Status, Intent, and management operations
+
+| Operation family | Contract behavior and Client boundary |
+|---|---|
+| `status.snapshot`, `status.changes` | Authenticated authoritative snapshot plus partial, cursor-based changes. Reconcile periodically with snapshots; this is not a complete push event feed. Display source, age, and stale state. |
+| `intent.submit`, `intent.list/get/status` | Submit user-confirmed text or a reviewed local transcript. A completed Intent dispatch is not proof a Worker consumed input or a Goal completed. Read history and detail only on demand; responses may contain sensitive text and do not belong in durable Client caches or logs. |
+| `goal.result`, `goal.lifecycle` | Results are owner-scoped and bounded. Lifecycle changes require an authorized role, current expected version, and fresh authoritative state. A queued Goal state is not a claim about a running native Worker. |
+| `topology.snapshot/apply` | Versioned same-owner Group, Endpoint membership, role, and Link-proposal operations. A failed write or 409 requires a fresh authoritative read; parent Group permissions do not propagate to child Groups. |
+| `nodes.preview/confirm/list/revoke` | Node generates and keeps its Node credential. Client displays a short code, previews it, then asks the user to confirm through encrypted RPC. Confirmation does not give the Client the Node credential. |
+| `approvals.list/decide` | The authorized user decides a real pending approval. A Monitor cannot approve for a User. The approval body is Hub-visible management data; do not describe this path as peer-message blind encryption. |
+| `devices.list/revoke` | Versioned owner-device management. The current Client must not offer self-revocation when the accepted response could no longer be delivered. |
+| `link.*` | Owner-scoped invitations and key-consent records are proposals. The fixed contract advertises `external_thread_links=false`; these operations do not enable cross-user message routing. |
+| `group.key_manifest/grant/status` | Fixed v1.2.1 returns a complete Endpoint attestation and owner grant fields. Android independently verifies the proof and binding, accepts an externally signed `signed_proof`, requires explicit confirmation, and reads the current Hub status through a dedicated encrypted method. A disposable fixed-image run with a real native Codex Endpoint reached `CURRENT`, then `STALE` after lease expiry and `PROOF_EXPIRED` after proof expiry. The Owner private key stayed outside the APK. See the [Group key acceptance report](client-group-key-v1.2.1-disposable-validation.md). |
+
+The fixed wire contract keeps `status_events=false` and routable `external_thread_links=false`. Client status pages use partial changes and periodic snapshot reconciliation. Cross-user invitations must be described as proposals, never as a connected Thread or permission to send messages.
+
+## Endpoint attestation v1 correction
+
+The v1.2.1 bundle corrects the published Endpoint attestation signature input. `EndpointKeyAttestation` v1 is compact JSON with ordered fields `version, endpoint_id, principal_id, node_id, binding_id, binding_epoch, public_identity, signature`. To produce unsigned claims, the `signature` field remains present with JSON value `null`. The signature input is:
+
+```text
+UTF-8("cicada/fabric/endpoint-key-attestation/v1\x00") || compact_JSON(unsigned_claims)
+```
+
+The new public synthetic vector contains the complete proof, public identity, signed-input bytes, and proof digest. Android must verify the raw proof digest, ML-DSA-65 signature, public-key identity and fingerprint, all endpoint/principal/node/session-binding values and epochs, and the binding and manifest digests before accepting an owner grant. Candidate APK `70423555e96381722d1bdc46633d32c0fca6dc32edae4dfb45865abc1059d197` passed `EndpointAttestationVectorTest` (`OK (4 tests)`), covering the full proof, synthetic manifest digests, and owner proof. Subsequent review found that its timestamp check rejected valid RFC3339Nano timestamps with four fractional digits. That candidate failed the timestamp-compatibility case; the fix is in commit `af3ad451e29d0c43142b3fc792272bbd6df75c84`. The corrected APK `2762a2defd13a0d85bc9a7c96647cbe626f632314ac958d4d1fe689ebd346b76` and AndroidTest APK `711e00f9fee11582c81af14e5a2c9d77799412166a8a3cd7008ec7cb16d27ab0` passed a rebuild and `EndpointAttestationVectorTest` (`OK (4 tests)`, ADB exit 0). A self-attestation proves possession of an Endpoint key, not owner consent or current Hub authority.
+
+## Runtime validation limits
+
+- Package, manifest, and image-label checks: **PASS**.
+- Encrypted Android `session.capabilities`: **PASS**.
+- Recovery on a disposable fixed-image Hub: **PASS** for `STILL_PROCESSING`, restart-after-`FAULT_READY` `OUTCOME_UNCERTAIN`, and `RECOVERY_UNAVAILABLE`.
+- Corrected Endpoint vector, synthetic-manifest, and owner-proof tests: **PASS** on APK `2762a2defd13a0d85bc9a7c96647cbe626f632314ac958d4d1fe689ebd346b76` (`EndpointAttestationVectorTest`, `OK (4 tests)`, ADB exit 0).
+- RFC3339Nano four-digit fractional timestamp compatibility: **FAIL** on the earlier `70423555…` candidate; **PASS** after the fix in `af3ad451e29d0c43142b3fc792272bbd6df75c84`.
+- Android native Group preview/grant path: implemented with external signed-proof import and explicit user confirmation. No owner private key is imported into the APK.
+- Positive Group grant against the fixed Hub: **PASS** on the final Group APK with a real native Codex Endpoint, independent external Owner signature and on-device confirmation. Status transitioned from `CURRENT` to `STALE` when the native lease expired, then to `PROOF_EXPIRED` after the signed proof expired. See the [separate acceptance record](client-group-key-v1.2.1-disposable-validation.md) for exact artifacts and limits.
+- Real Node/Codex approval against this fixed image: **PASS** on the emulator with APK `70423555…`; same native Thread and Worker attempt 1, one Android approval, Worker/Goal completed, Intent resolved, and `goal.result` byte-matched. It does not establish physical-device or public HTTPS validation.
+- Physical Android device and public HTTPS: **NOT_RUN**.
+
+See the [validation report](client-hub-v1.2.1-967dbd-validation.md) for commands, exits, evidence paths, and the recorded failed initial recovery attempt. Do not infer an unlisted operation's Android compatibility from this protocol document.

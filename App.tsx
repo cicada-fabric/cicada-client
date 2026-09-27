@@ -250,6 +250,13 @@ function Client(): React.JSX.Element {
   const [expandedIntentId, setExpandedIntentId] = useState('');
   const intentHistoryGeneration = useRef(0);
   const [groupName, setGroupName] = useState('');
+  const [keyGroupId, setKeyGroupId] = useState('');
+  const [keyEndpointId, setKeyEndpointId] = useState('');
+  const [keyOwnerId, setKeyOwnerId] = useState('');
+  const [keySignedProof, setKeySignedProof] = useState('');
+  const [verifiedKeyManifest, setVerifiedKeyManifest] = useState<JsonObject | null>(null);
+  const [keyGrantStatus, setKeyGrantStatus] = useState<JsonObject | null>(null);
+  const [keyConsentBusy, setKeyConsentBusy] = useState(false);
   const [parentGroupId, setParentGroupId] = useState('');
   const [joinEndpointId, setJoinEndpointId] = useState('');
   const [joinGroupId, setJoinGroupId] = useState('');
@@ -365,8 +372,8 @@ function Client(): React.JSX.Element {
       session?.available_rpc_operations.includes(operation));
   const goalResultAvailable = (capabilities = hubCapabilities,
     session = sessionCapabilities, status = hubStatus) => Boolean(
-    session?.role === 'manager' && session.contract_revision === 'client-hub-v1.2' &&
-    capabilities?.contract_revision === 'client-hub-v1.2' &&
+    session?.role === 'manager' && session.contract_revision === 'client-hub-v1.2.1' &&
+    capabilities?.contract_revision === 'client-hub-v1.2.1' &&
     session.catalog_sha256 === capabilities.catalog_sha256 &&
     capsAllows(capabilities, 'control_intents', 'goal.result', status) &&
     session.available_rpc_operations.includes('goal.result'));
@@ -1143,6 +1150,65 @@ function Client(): React.JSX.Element {
       group: {name}, ...(parentGroupId.trim() ? {parent_group_id: parentGroupId.trim()} : {}),
     }}, '创建 Group');
   };
+  const previewGroupKey = async () => {
+    const groupId = keyGroupId.trim();
+    const endpointId = keyEndpointId.trim();
+    const ownerKeyId = keyOwnerId.trim();
+    if (!groupId || !endpointId || !ownerKeyId) return;
+    setKeyConsentBusy(true);
+    setVerifiedKeyManifest(null);
+    setKeySignedProof('');
+    setKeyGrantStatus(null);
+    try {
+      const response = await clientHub.previewGroupKey({groupId, endpointId, ownerKeyId});
+      if (!response.ok || response.verified !== true) throw new Error('Endpoint 证明未通过完整验证');
+      setVerifiedKeyManifest(response.result);
+      setHubMessage('Endpoint 证明、公钥、绑定与 manifest 摘要已在设备上验证。请核对身份和有效期，再由独立 owner 签名器签署。');
+    } catch (error) { setHubMessage('Group 密钥预览失败：' + safeHubError(error)); }
+    finally { setKeyConsentBusy(false); await refreshHubStatus(); }
+  };
+  const refreshGroupKeyStatus = async (groupId = keyGroupId.trim(), endpointId = keyEndpointId.trim()) => {
+    if (!groupId || !endpointId || !operationAllowed(hubStatus, 'group.key_status')) return;
+    setKeyConsentBusy(true);
+    try {
+      const response = await clientHub.groupKeyStatus({groupId, endpointId});
+      if (!response.ok || !response.result) throw new Error('Hub 未返回此 Group 与 Endpoint 的当前授权');
+      setKeyGrantStatus(response.result);
+      setHubMessage('已读取 Hub 的当前 Group Endpoint 公钥授权状态。');
+    } catch (error) {
+      setKeyGrantStatus(null);
+      setHubMessage('读取 Group 公钥授权状态失败：' + safeHubError(error));
+    } finally { setKeyConsentBusy(false); await refreshHubStatus(); }
+  };
+  const approveGroupKey = () => {
+    const manifest = verifiedKeyManifest;
+    if (!manifest || !keySignedProof.trim()) return;
+    const groupId = field(manifest, 'group_id');
+    const endpointId = field(manifest, 'endpoint_id');
+    const ownerKeyId = field(manifest, 'owner_key_id');
+    const expectedDigest = field(manifest, 'digest');
+    Alert.alert('明确授权 Group Endpoint 公钥',
+      `Group ${groupId}\nEndpoint ${endpointId}\nPrincipal ${field(manifest, 'principal_id')}\nNode ${field(manifest, 'node_id')}\nBinding ${field(manifest, 'binding_id')} / epoch ${field(manifest, 'binding_epoch')}\nGroup/Membership/Join revisions ${field(manifest, 'group_revision')}/${field(manifest, 'membership_revision')}/${field(manifest, 'endpoint_join_revision')}\n公钥指纹 ${field(manifest, 'candidate_fingerprint')}\nManifest ${expectedDigest}\n截止 ${field(manifest, 'expires_at')}\n\n只有独立 owner 签名与新鲜 manifest 均匹配才提交。`, [
+        {text: '取消', style: 'cancel'},
+        {text: '批准并提交', onPress: async () => {
+          setKeyConsentBusy(true);
+          try {
+            const result = await clientHub.grantGroupKey({groupId, endpointId, ownerKeyId,
+              expectedDigest, signedProofBase64: keySignedProof.trim()}) as {ok?: boolean; result?: JsonObject};
+            if (!result.ok) throw new Error('Hub 未确认 Group Key Grant');
+            const current = await clientHub.groupKeyStatus({groupId, endpointId});
+            if (!current.ok || !current.result) throw new Error('Hub 未返回授权后的权威状态');
+            setKeyGrantStatus(current.result);
+            setHubMessage('Hub 已接受 owner 签名；权威状态：' + field(current.result, 'current_status'));
+            setVerifiedKeyManifest(null);
+            setKeySignedProof('');
+          } catch (error) {
+            setVerifiedKeyManifest(null);
+            setHubMessage('Group Key Grant 未确认：' + safeHubError(error) + '。请重新读取权威 manifest。');
+          } finally { setKeyConsentBusy(false); await refreshHubStatus(); }
+        }},
+      ]);
+  };
   const joinGroup = () => {
     if (!joinEndpointId.trim() || !joinGroupId.trim()) return;
     applyTopology({kind: 'endpoint.join_group', join_group: {
@@ -1674,6 +1740,39 @@ function Client(): React.JSX.Element {
             <Text style={s.description}>{(topologySnapshot?.groups || []).length} 个 Group · {(topologySnapshot?.memberships || []).length} 个 Membership · {(topologySnapshot?.endpoints || []).length} 个 Endpoint</Text>
             <Text style={s.small}>来源：topology.snapshot · {topologySnapshot?.captured_at || '尚未读取'}</Text>
           </Card>
+          {capsAllows(hubCapabilities, 'group_endpoint_key_grants', 'group.key_manifest', hubStatus) &&
+            operationAllowed(hubStatus, 'group.key_grant') && <Card>
+            <Text style={s.cardTitle}>Group Endpoint 公钥授权</Text>
+            <Text style={s.description}>设备独立核对完整 Endpoint 证明和所有绑定摘要；owner 使用独立签名器签署，不在手机输入私钥。</Text>
+            <TextInput style={s.hubInput} value={keyGroupId} onChangeText={value => {
+              setKeyGroupId(value); setVerifiedKeyManifest(null); setKeySignedProof(''); setKeyGrantStatus(null);
+            }} placeholder="Group ID" accessibilityLabel="公钥授权 Group ID" />
+            <TextInput style={s.hubInput} value={keyEndpointId} onChangeText={value => {
+              setKeyEndpointId(value); setVerifiedKeyManifest(null); setKeySignedProof(''); setKeyGrantStatus(null);
+            }} placeholder="Endpoint ID" accessibilityLabel="公钥授权 Endpoint ID" />
+            <TextInput style={s.hubInput} value={keyOwnerId} onChangeText={value => {
+              setKeyOwnerId(value); setVerifiedKeyManifest(null); setKeySignedProof('');
+            }} placeholder="独立 owner 公钥 ID" accessibilityLabel="公钥授权 Owner key ID" />
+            <Button title="读取并验证候选证明" onPress={previewGroupKey} secondary={keyConsentBusy}
+              disabled={keyConsentBusy || !keyGroupId.trim() || !keyEndpointId.trim() || !keyOwnerId.trim()} />
+            {operationAllowed(hubStatus, 'group.key_status') && <Button
+              title="刷新当前授权状态" secondary onPress={() => refreshGroupKeyStatus()}
+              disabled={keyConsentBusy || !keyGroupId.trim() || !keyEndpointId.trim()} />}
+            {keyGrantStatus && <Text style={s.small}>
+              Hub 当前状态：{field(keyGrantStatus, 'current_status')} · 接受于 {field(keyGrantStatus, 'accepted_at') || '未知'}
+            </Text>}
+            {verifiedKeyManifest && <>
+              <Text style={s.small}>已验证：{field(verifiedKeyManifest, 'principal_id')} / {field(verifiedKeyManifest, 'node_id')} · epoch {field(verifiedKeyManifest, 'binding_epoch')}</Text>
+              <Text style={s.small}>公钥：{field(verifiedKeyManifest, 'candidate_fingerprint')}</Text>
+              <Text style={s.small}>Manifest：{field(verifiedKeyManifest, 'digest')} · 截止 {field(verifiedKeyManifest, 'expires_at')}</Text>
+              <Button title="查看独立签名参数" secondary onPress={() => show('Owner Group Key Grant 签名参数',
+                `owner_id=${field(verifiedKeyManifest, 'owner_id')}\nlink_id=group-endpoint-key-grant:v1\ncontract_digest=${field(verifiedKeyManifest, 'digest')}\nkey_binding_digest=${field(verifiedKeyManifest, 'candidate_binding_digest')}\nexpected_link_version=${field(verifiedKeyManifest, 'candidate_version')}\nside=SOURCE\nissued_at=${field(verifiedKeyManifest, 'issued_at')}\nexpires_at=${field(verifiedKeyManifest, 'expires_at')}\nowner_key_id=${field(verifiedKeyManifest, 'owner_key_id')}`)} />
+              <TextInput style={s.hubInput} value={keySignedProof} onChangeText={setKeySignedProof}
+                placeholder="独立签名器返回的 owner signed_proof（base64）" accessibilityLabel="Owner 签名证明" />
+              <Button title="核对并明确批准" onPress={approveGroupKey} secondary={keyConsentBusy}
+                disabled={keyConsentBusy || !keySignedProof.trim()} />
+            </>}
+          </Card>}
           <ActionCard title={showTopologyEditor ? '收起拓扑管理' : '管理拓扑'}
             body="查看权威 Group、成员、Endpoint 和 Link；获准时可编辑。"
             onPress={() => setShowTopologyEditor(open => !open)} />
@@ -2196,7 +2295,7 @@ function LinkProposalPanel({status, capabilities, request, recoveredInvite, clea
       onPress={() => { if (!busy) void readLinks(); }} />
     <Notice>{capabilities.external_thread_links ?
       '此页只管理双方同意的提案；Client 尚未提供普通 peer 消息入口。密钥 Grant 签署待端侧验证器完成。' :
-      'external_thread_links=false：Hub 只开放邀请与 PROPOSED 提案；不显示聊天、消息发送或已连通状态。密钥 Grant 签署待端侧验证器完成。'}</Notice>
+      'external_thread_links=false：Hub 只开放邀请与 PROPOSED 提案；不显示聊天、消息发送或已连通状态。跨用户 Link 密钥 Grant 仍关闭。'}</Notice>
     {!!message && <Text style={s.small}>{message}</Text>}
     {loaded && links.length === 0 && <Text style={s.small}>当前没有本人可见的 Link 提案。</Text>}
     {links.map(item => {

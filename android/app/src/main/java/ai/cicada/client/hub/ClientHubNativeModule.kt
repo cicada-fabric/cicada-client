@@ -83,6 +83,25 @@ class ClientHubNativeModule(context: ReactApplicationContext) : ReactContextBase
     @com.facebook.react.bridge.ReactMethod
     fun retryPendingExact(promise: Promise) = run(promise) { session.retryPendingExact() }
 
+    @com.facebook.react.bridge.ReactMethod
+    fun previewGroupKey(options: ReadableMap, promise: Promise) = run(promise) {
+        session.previewGroupKey(requiredString(options, "groupId"),
+            requiredString(options, "endpointId"), requiredString(options, "ownerKeyId"))
+    }
+
+    @com.facebook.react.bridge.ReactMethod
+    fun grantGroupKey(options: ReadableMap, promise: Promise) = run(promise) {
+        session.grantGroupKey(requiredString(options, "groupId"),
+            requiredString(options, "endpointId"), requiredString(options, "ownerKeyId"),
+            requiredString(options, "expectedDigest"), requiredString(options, "signedProofBase64"))
+    }
+
+    @com.facebook.react.bridge.ReactMethod
+    fun getGroupKeyStatus(options: ReadableMap, promise: Promise) = run(promise) {
+        session.groupKeyStatus(requiredString(options, "groupId"),
+            requiredString(options, "endpointId"))
+    }
+
     private fun run(promise: Promise, action: () -> JsonObject) {
         try {
             worker.execute {

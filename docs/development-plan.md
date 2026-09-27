@@ -1,31 +1,45 @@
-# CICADA Client 开发与验收计划（2026-09-25）
+# CICADA Client development and validation plan
 
-本仓库只开发手机 Client，当前只交付 Android。核心 Architecture v2.1 与固定 Go 路由为契约依据；[真实接口清单](backend-contract.md)和[当前固定镜像验收](client-hub-v1.2-41beaf0-validation.md)记录本轮证据。[早期 v1.2 验收](client-hub-v1.2-validation.md)与 [v1.1 验收](client-hub-v1.1-validation.md)仅是历史记录，不能认证 `41beaf0` Hub。所有远程操作必须先通过独立固定的 Hub 公钥、OwnerDeviceGrant、加密 `session.capabilities` 与服务端 Guard；不使用旧 `/v1` bearer。
+**Last updated:** 2026-09-25
 
-## 已完成的基线
+This repository develops the mobile Client only. Android is the current target. The fixed integration baseline is Hub commit `967dbd885fae9a150b3d9a77c8e4e30da1d0dd8a`, contract `client-hub-v1.2.1`, protocol archive SHA-256 `7bf1e3702eadf9fc3ffd50a0e8ab1213db0844b2bf418b577b88ba239216bf8a`, catalog SHA-256 `25c3d7f585b1811781cb46669a09e2e08ab8c58765a7b9318145cea5bbce4df9`, and full local image ID `sha256:adca1c62db5747625141be4506c4f3713368260076c50876776b4dabafa6c1b7`. The [backend contract](backend-contract.md) describes the wire behavior; the [v1.2.1 validation report](client-hub-v1.2.1-967dbd-validation.md) records runtime evidence. Results for the earlier `41beaf0` image are historical only.
 
-| 范围 | 状态与证据 |
+## Current status
+
+| Area | State |
 |---|---|
-| 五页 Android UI、便捷语音与文字入口 | 已实现；Docker Android 35 模拟器打开五页和输入面板。未登录显示未知/空状态，不注入开发 fixture。 |
-| 可选本地 STT | Vosk 中英、Paraformer 中文、SenseVoice Small INT8 可分别下载安装、选择和删除；Docker 公开音频推理、Android 模拟器四款模型的下载/选择或 JNI 实测见 [STT 记录](stt-validation.md)。本轮修正 SenseVoice `tokens.txt` 的截断 SHA-256，并在模拟器验证了真实下载、安装、选择与中文推理；Vosk 英文也通过真实下载和英文推理。真机麦克风、内存、耗电未测。 |
-| Client→Control PQ 安全会话 | Android Kotlin 设备 ML-KEM/ML-DSA 身份、Keystore 包裹、可信 Hub 公钥固定、Owner Grant 登记和加密 `/v2/client/rpc` 已实现；真实 Docker Hub 测过重放、篡改、撤权、断线和精确密文恢复。 |
-| 权威状态与基础管理 | `session.capabilities` 授权下读取 `status.snapshot/changes`，提交并查询当前 `intent`，操作 `topology.*`、`nodes.*`、`approvals.*`；真实 Hub 通过成功与部分业务拒绝路径。 |
+| Protocol package, manifest, image labels | **PASS** for the fixed target. The imported bundle records the exact commit, `source_dirty=false`, and catalog digest. |
+| Android encrypted session | **PASS**. An independent Android session verified encrypted `session.capabilities` against the fixed Hub. |
+| Android app/test build | **PASS** for the corrected artifacts listed in the validation report. TypeScript, lint, contract, and whitespace checks also exited 0. |
+| Lost enrollment and RPC responses | **PASS**. Android retried the exact saved Owner Grant and recovered the exact RPC response on the fixed image. |
+| Three recovery faults | **PASS** on a disposable `/tmp` Hub: `STILL_PROCESSING`, Hub restart after `FAULT_READY` yielding `OUTCOME_UNCERTAIN`, and `RECOVERY_UNAVAILABLE`. Android retained the original packet and did not create a second operation. |
+| Endpoint attestation, synthetic manifest, and owner proof | **PASS** on corrected APK `2762a2defd13a0d85bc9a7c96647cbe626f632314ac958d4d1fe689ebd346b76`; `EndpointAttestationVectorTest` returned `OK (4 tests)`, ADB exit 0. The earlier `70423555…` candidate failed the valid four-digit RFC3339Nano timestamp case; commit `af3ad451e29d0c43142b3fc792272bbd6df75c84` fixes it. |
+| Native Group preview/grant/status implementation | Implemented with external signed-proof import, explicit Android confirmation and a dedicated encrypted status read. The APK does not import the owner private key; it verifies against the owner public approval key saved from authenticated enrollment. The fixed-image live acceptance passed. |
+| Positive Group grant against the fixed Hub | **PASS** on a disposable fixed-image Hub with a real native Codex Endpoint, external Owner signing, explicit Android confirmation, and encrypted `group.key_status=CURRENT`. The same grant became `STALE` after the native lease expired, then `PROOF_EXPIRED` after proof expiry. Exact artifacts and limits are in the [Group key acceptance report](client-group-key-v1.2.1-disposable-validation.md). |
+| Real Node/Codex approval | **PASS** on the fixed image with E2E candidate APK `70423555e96381722d1bdc46633d32c0fca6dc32edae4dfb45865abc1059d197`: one original Codex turn was approved on the same native Thread/Worker attempt 1, Worker and Goal completed, Intent resolved, and `goal.result` matched 30 bytes. This does not validate Group grant or production TLS. |
+| Physical Android device and public HTTPS | **NOT_RUN**. |
 
-## 当前依赖与阶段顺序
+The full command and evidence record is in [the v1.2.1 validation report](client-hub-v1.2.1-967dbd-validation.md). An initial recovery-fixture attempt failed with HTTP 502 because the fixture was not run from `/tmp`; the corrected disposable-Hub runs passed and both results are recorded separately. The four-digit RFC3339Nano compatibility issue found in one candidate was fixed, rebuilt, and retested successfully.
 
-当前优先项是 [v1.2 接口请求](hub-interface-requests-v12.md)中的 Endpoint attestation 签名字节冲突和固定镜像的确定性恢复故障入口。真实远端 Node/Codex 审批桥已在 Android 模拟器与 `41beaf0` 固定镜像上通过，同一 Worker attempt 和原生 Thread 的证据见[当前验收](client-hub-v1.2-41beaf0-validation.md)。Group Endpoint Key Grant 在签名字节合同一致且完整 proof 本地验签前维持关闭。
+## Product and model work
 
-### v1.2 后续步骤
+The app retains the five-page Android UI, a clear voice entry point, editable transcripts, and a text composer that works without a speech model. The model centre offers only models with a real format/runtime/device validation record. Model weights are optional, verified before installation, and kept in app-private storage. See [model selection](model-selection.md) and [speech validation](stt-validation.md) for model sources, licenses, command results, timings, and limitations. Host inference does not count as physical Android testing; microphone, memory, battery, and background-resume measurements on a physical device remain **NOT_RUN**.
 
-1. 核心明确 Endpoint attestation 的唯一签名原文，提供修订协议包、干净 commit、完整镜像 ID 和合成向量；Client 才实现原始 proof SHA-256、ML-DSA-65、公钥与所有 binding/revision/manifest digest 独立校验，再开放 owner 签署。
-2. 核心提供隔离固定镜像的可复现故障入口；Android 分别验证 `STILL_PROCESSING`、签名密文 `OUTCOME_UNCERTAIN`、旧请求 `RECOVERY_UNAVAILABLE`，并校验跨重启证据与无重复操作。
-3. 对真实 Node/Codex 审批闭环保留固定镜像的可复跑隔离证据；随后单独验收真机与公网 HTTPS。阶段性通过后再考虑合入 main。
+State views distinguish Node connectivity, native session binding, Worker execution, Goal lifecycle, Intent dispatch, and Artifact references. They show authority, observation time, and stale state. Large lists load on demand. When the app is disconnected or unauthorized, it must not show development fixtures or claim that a message was sent, an approval was granted, a Goal completed, or a Thread connected.
 
-4. 在真实设备上测麦克风、中文准确率、加载和推理耗时、峰值内存、电量以及前后台恢复；另测公网 HTTPS、证书和延迟。GB 级模型经空间预检和中断恢复验证后再开放。
-5. 完整状态推送、跨用户 Thread 的真实双端授权、普通 peer 盲 Hub 加密、设备换机与密钥轮换依赖核心合同和端到端验收；能力为 `false` 时保持入口关闭。iOS 和原生鸿蒙作为独立平台阶段，复用产品行为与协议测试向量。
+## Remaining gates
 
-## 每阶段工作规则
+1. Preserve the completed fixed-image Group key trace and add a separate two-Owner fixture when cross-owner authorization needs acceptance. The one-Owner disposable run established the positive path and rejected wrong key selection and nonexistent Group/Endpoint status reads; it did not test a second real Owner.
+2. Preserve the completed fixed-image Node/Codex trace in the validation record. Any new Hub image or Client protocol change needs its own run; do not transfer results from historical `41beaf0` or the separate Group verifier artifact.
+3. Test on a physical Android device: enrollment and Keystore boundary, foreground/background recovery, microphone capture, supported model download and inference, latency, memory, and battery. Mark each item `NOT_RUN` until measured.
+4. Validate production-style public HTTPS, certificate checks, device network behavior, and recovery after network changes. Do not infer this from emulator-to-host HTTP.
+5. Keep full status push, cross-user Thread routing, equipment migration/recovery, iOS, and native HarmonyOS as separate future gates. Native HarmonyOS requires an ArkUI/ArkTS app; the React Native TSX UI is not a native Ark application.
 
-- Docker 数据根目录须为 `/gpu1-share/data/docker-root`；Client 缓存、模型、APK、测试密钥与输出只放 `/gpu1-share/data/cicada-client`，不入 Git。只在本仓库编辑；核心仓库只读。运行一次性固定镜像 Hub，测试 Owner 公钥仅通过正式命令登记到隔离状态，不触碰常驻 Hub 或直接修改数据库。
-- 固定依赖版本；按需加载大量列表和详情。HTTP 200、入队、Intent `DONE`、Node 在线与 Worker/Goal 完成是不同事实，必须显示来源与观察时间。
-- 先做有意义的真实 Hub 与 Android 验证，再在 `dev/` 分支阶段性提交。不自动推送、合入 `main`、发布、部署生产或轮换真实密钥。每次交付记录命令、退出码、未运行项和安全边界。
+## Development and safety rules
+
+- Develop, build, and test in Docker. Verify Docker data root `/gpu1-share/data/docker-root`; keep project cache, model downloads, APKs, test identities, and temporary Hub state under `/gpu1-share/data/cicada-client`. Do not alter `/gpu1-share/data/cicada` data or global Docker configuration.
+- Work only in this Client repository. Treat the adjacent CICADA core as read-only. Use one-time disposable Hub state for integration tests; never inspect or edit its database from Android.
+- Fixed dependencies use lock files. Do not put real API keys, long-lived bearer credentials, private keys, complete sensitive messages, audio recordings, or model-test personal audio in Git, APKs, snapshots, persistent caches, logs, or analytics.
+- All user content and management operations use independently pinned Client-Control PQ encryption and encrypted `session.capabilities`. No old `/v1` bearer fallback. Every write uses server guards, expected versions, idempotency, and authoritative rereads after conflict or uncertain network outcome.
+- A protocol package, public capability flag, Hub image tag, HTTP 200, or test fixture is not runtime proof. Record exact package, complete image ID, app artifact, command, exit code, outcome, and limits for each validation.
+- Do not push, merge, publish, deploy production, rotate keys, or change global CLI/Docker configuration automatically.

@@ -8,14 +8,14 @@ import json
 from pathlib import Path
 
 
-ROOT = Path(__file__).resolve().parent.parent / "contracts" / "client-hub-v1.2-41beaf0"
-SOURCE_REVISION = "41beaf0fa57e8279ad993fa4ce070a33515851ba"
-CATALOG_SHA256 = "613084ee67f75d27762ddaf59ec2e5b33ebea7383cbfcf455a50b472e756c66a"
+ROOT = Path(__file__).resolve().parent.parent / "contracts" / "client-hub-v1.2.1-967dbd"
+SOURCE_REVISION = "967dbd885fae9a150b3d9a77c8e4e30da1d0dd8a"
+CATALOG_SHA256 = "25c3d7f585b1811781cb46669a09e2e08ab8c58765a7b9318145cea5bbce4df9"
 
 
 def main() -> None:
     manifest = json.loads((ROOT / "manifest.json").read_text(encoding="utf-8"))
-    assert manifest["contract_revision"] == "client-hub-v1.2"
+    assert manifest["contract_revision"] == "client-hub-v1.2.1"
     assert manifest["source_revision"] == SOURCE_REVISION
     assert manifest["source_dirty"] is False
     assert manifest["catalog_sha256"] == CATALOG_SHA256
@@ -40,7 +40,7 @@ def main() -> None:
     catalog = json.loads(catalog_bytes)
     assert catalog["contract_revision"] == manifest["contract_revision"]
     assert catalog["wire_version"] == manifest["wire_version"]
-    print(f"PASS client-hub-v1.2 {CATALOG_SHA256} ({len(listed)} files)")
+    print(f"PASS client-hub-v1.2.1 {CATALOG_SHA256} ({len(listed)} files)")
 
 
 if __name__ == "__main__":

@@ -1,113 +1,60 @@
-# Hub v1.2 接口请求与完成项
+# Hub v1.2 interface requests and v1.2.1 status
 
-## BLOCKED：Group Endpoint attestation 的签名原文不一致
+**Current fixed target:** CICADA Hub commit `967dbd885fae9a150b3d9a77c8e4e30da1d0dd8a`, contract `client-hub-v1.2.1`, protocol archive SHA-256 `7bf1e3702eadf9fc3ffd50a0e8ab1213db0844b2bf418b577b88ba239216bf8a`, catalog SHA-256 `25c3d7f585b1811781cb46669a09e2e08ab8c58765a7b9318145cea5bbce4df9`, and full image ID `sha256:adca1c62db5747625141be4506c4f3713368260076c50876776b4dabafa6c1b7`.
 
-**固定版本**
+This file tracks the requests previously raised against v1.2 and their current disposition. The exact command results and evidence boundaries are in the [v1.2.1 validation report](client-hub-v1.2.1-967dbd-validation.md). The [41beaf0 report](client-hub-v1.2-41beaf0-validation.md) remains a historical record and does not establish behavior of this image.
 
-- Hub commit：`41beaf0fa57e8279ad993fa4ce070a33515851ba`
-- 协议包 SHA-256：`e42cdca3d9f2b8719179476e2e7e87a2a9793c8c5b2a8352331928f882d18d5d`
-- catalog SHA-256：`613084ee67f75d27762ddaf59ec2e5b33ebea7383cbfcf455a50b472e756c66a`
-- Hub 镜像 ID：`sha256:528dc6817a35a37c1c028dce85243afb3a7e42b4b04ed9410bd68046ef7d67e8`
+## Resolved in the v1.2.1 contract
 
-**问题**
+### Endpoint attestation signature input
 
-协议包 `docs/client-hub-wire-v1.md` 的 “Complete Group Endpoint key evidence” 节说明，
-`EndpointKeyAttestation` 的 ML-DSA-65 签名输入是按给定字段顺序生成的
-`unsigned_claims`，并且**排除 `signature` 字段**。
+The v1.2 wire prose required `EndpointKeyAttestation` v1 signing bytes to omit the `signature` field. The Hub implementation instead marshals the complete DTO with its nil `[]byte` signature, producing a final `"signature":null` property. This made the prose and implementation disagree.
 
-同一固定 Hub commit 的
-`cicada-go/internal/e2ee/endpoint_attestation.go` 定义 `Signature` 为 `[]byte`，
-JSON tag 是 `json:"signature"` 且没有 `omitempty`。`endpointAttestationSignedBytes` 把
-`Signature` 设为 `nil` 后直接调用 `json.Marshal(attestation)`。Go 的
-`encoding/json` 会把 nil `[]byte` 序列化为 `null`，所以源码实际签名原文包含
-末尾的 `"signature":null`，而不是省略这个字段。Go 签发端和校验端都复用该函数。
+The v1.2.1 wire contract now defines the exact implemented bytes: compact JSON fields in order `version, endpoint_id, principal_id, node_id, binding_id, binding_epoch, public_identity, signature`, with `signature` set to JSON `null` while producing the unsigned claims. The signature input is:
 
-因此，严格按固定协议包实现的 Client 会拒绝当前 Go 实现生成的 Endpoint
-attestation。若 Client 改按源码签名，则会偏离固定合同。当前不允许据此为
-`group.key_grant` 生成 owner 签名；Hub 返回的 candidate/manifest 摘要不能消除此冲突。
-
-**请 CICADA 核心维护者确认并修正**
-
-请明确选择唯一的签名原文，并使 Hub 签发、Hub 校验、Node 校验、协议文档和独立
-Kotlin 测试向量完全一致：
-
-1. 若合同定义正确，请修改 Go 签发与校验，使签名原文省略 `signature` 字段；
-   检查并更新所有 Endpoint attestation 的调用方与测试。
-2. 若 Go 当前行为定义正确，请修订合同，明确 unsigned JSON 中
-   `signature:null` 的位置和字节形式。
-
-无论选择哪项，请提供一个仅使用合成密钥的公开向量，至少包含完整
-`candidate_attestation` 原始字节、预期 SHA-256、签名原文的精确 UTF-8 字节
-（或十六进制）、完整 ML-DSA-65 公钥及独立验证结果。随后以干净 Hub commit
-重新导出协议包并提供匹配的 commit、catalog SHA-256 和完整镜像 ID；manifest
-须保持 `source_dirty=false`。
-
-**复现步骤**
-
-以下命令仅读取 CICADA 中固定 commit 的源码和提供的协议包：
-
-```bash
-tar -xOzf ../CICADA/.cicada-data/contracts/client-hub-e42cdca3d9f2b8719179476e2e7e87a2a9793c8c5b2a8352331928f882d18d5d.tar.gz docs/client-hub-wire-v1.md \
-  | nl -ba | sed -n '148,163p'
-
-git -C ../CICADA show 41beaf0fa57e8279ad993fa4ce070a33515851ba:cicada-go/internal/e2ee/endpoint_attestation.go \
-  | nl -ba | sed -n '23,52p'
+```text
+UTF-8("cicada/fabric/endpoint-key-attestation/v1\x00") || compact_JSON(unsigned_claims)
 ```
 
-最小 Go 行为复现：
+The fixed package includes a complete public synthetic vector with signed input, public identity, proof, and proof digest. A timestamp-format bug found in candidate `70423555e96381722d1bdc46633d32c0fca6dc32edae4dfb45865abc1059d197` was fixed in commit `af3ad451e29d0c43142b3fc792272bbd6df75c84`. Corrected APK `2762a2defd13a0d85bc9a7c96647cbe626f632314ac958d4d1fe689ebd346b76` passed `EndpointAttestationVectorTest` (`OK (4 tests)`), including the full proof, synthetic manifest digests, and owner proof. The native Group preview/grant path imports an external signed proof and requires explicit Android confirmation. The owner private key is not imported into the APK; the app verifies using the owner public approval key saved from authenticated enrollment. A later disposable fixture supplied an authorized native Endpoint candidate and passed the positive Group path on a separate final APK; see the [Group acceptance report](client-group-key-v1.2.1-disposable-validation.md).
 
-```go
-package main
+### Deterministic recovery fault cases
 
-import (
-	"encoding/json"
-	"fmt"
-)
+The fixed v1.2.1 test fixture provides deterministic recovery fault cases on a disposable Hub. The Android Client passed each case with an independent session. The uncertain case waited for `FAULT_READY` and restarted the disposable Hub before `/v2/client/rpc/recover`.
 
-type Attestation struct {
-	Signature []byte `json:"signature"`
-}
-
-func main() {
-	encoded, _ := json.Marshal(Attestation{Signature: nil})
-	fmt.Println(string(encoded))
-}
-```
-
-输出为 `{"signature":null}`。固定 commit 中 `endpointAttestationSignedBytes`
-执行的正是将 `Signature` 设为 nil 后对完整结构体进行 `json.Marshal`。
-
-**验收门槛**
-
-收到修正后的固定交付和合成公开向量前，Client 不会将
-`group.key_manifest` 标记为已验证，也不会启用 `group.key_grant` owner 签署。
-
-## 需要固定镜像上的可复现恢复故障入口
-
-**请求：**请核心团队提供只在隔离测试环境启用的确定性入口或测试驱动，使用同一
-`41beaf0...` 镜像和公开 `/v2/client/rpc/recover`，分别让真实 Android 已登记
-设备遇到下列三个结果。入口不能要求 Android 读取 Hub 数据库、保存管理 bearer，
-也不能让生产 Hub 暴露控制故障的 API。
-
-| 场景 | 预期可观察结果 |
+| Case | Fixed-image Android result |
 |---|---|
-| 原始请求已持久接受、业务仍执行 | 原包 `/recover` 返回 HTTP 409 `STILL_PROCESSING`；Client 保留原包、operation ID 和序号，不新建任务。 |
-| 原始请求已接受、Hub 在最终响应密封前重启 | 原包 `/recover` 返回原预留响应序号的签名密文 `OUTCOME_UNCERTAIN`；Client 验签后保留业务不确定标记并读取权威状态。 |
-| 旧 schema 无预留响应序号的未确定请求 | 原包 `/recover` 返回 HTTP 409 `RECOVERY_UNAVAILABLE`；Client 不猜响应序号，不重新执行。 |
+| Accepted request remains processing | **PASS** — original packet recovery returns HTTP 409 `STILL_PROCESSING`; Client retains the same pending request. |
+| Accepted request becomes uncertain after Hub restart | **PASS** — after `FAULT_READY` and restart of the disposable Hub, recovery returns a signed encrypted `OUTCOME_UNCERTAIN`; Client reconciles without issuing a second write. |
+| Legacy request has no reserved response sequence | **PASS** — recovery returns HTTP 409 `RECOVERY_UNAVAILABLE`; Client fences the original packet and does not guess a response sequence. |
 
-**当前验证与缺口：**新固定镜像已用 Android 模拟器验证登记 201 响应丢失与
-RPC 200 响应丢失。三种 409/不确定结果仅有核心 Go 测试所覆盖的合成故障路径；
-本次未发现可在隔离运行镜像上安全、确定、可复跑地触发它们的入口。Client
-不读取或直接修改 Hub 数据库，也不要求在生产 RPC 中加入故障开关。因此上表
-三项固定镜像 Android 实测均为 **NOT_RUN**。请交付隔离测试驱动、准备与清理
-命令、预期 HTTP/密文证据，以及对应干净 Hub commit、协议包摘要和完整镜像 ID。
+The scenario runner, setup/recovery tests, exits, and Git-external logs are listed in the [validation report](client-hub-v1.2.1-967dbd-validation.md#recovery-faults-on-the-disposable-fixed-image). An earlier attempt outside `/tmp` failed with HTTP 502; the corrected `/tmp` run is the passing evidence.
 
-## 已通过：远端 Node/Codex 原生审批链路
+## Current validation gates
 
-`41beaf0` 固定镜像上，Android 模拟器经加密 `intent.submit` 创建 Goal；真实
-Node Agent 的 `gpt-5.6-luna` 原生 Codex turn 发出审批请求；Android 经加密
-`approvals.list/decide` 接受；同一 Worker 的 attempt 1 完成，Node 返回的原生
-Thread ID 摘要与 Android 所见审批请求的 Thread ID 摘要相同。Android 再用
-`intent.status` 与 `goal.result(intent_id)` 读取终态。脱敏证据与早期测试代理
-故障的修正过程见[当前验收](client-hub-v1.2-41beaf0-validation.md)。这项通过
-不替代 Android 真机或公网 HTTPS 验收。
+- **Android Group Endpoint grant on the fixed Hub: PASS.** A real native Codex Thread published the leased candidate. Final APK `cfe345272f2399cbed7cd76f47e25e3e6fc09ed94daadb1d6e1a6ba9106caff1` verified the complete manifest, accepted an externally signed Owner proof after an explicit on-device confirmation, and read encrypted `CURRENT`, `STALE`, then `PROOF_EXPIRED`. The [separate report](client-group-key-v1.2.1-disposable-validation.md) records exact evidence and narrower negative-test limits.
+- **Real Node/Codex approval on this image: PASS.** One original Codex turn was accepted on the same native Thread and Worker attempt 1; one Android approval was recorded; Worker/Goal completed, Intent resolved, and `goal.result` matched the 30-byte result. Exact evidence is in the [validation report](client-hub-v1.2.1-967dbd-validation.md). This result is specific to the fixed image and candidate APK noted there.
+- **Physical Android and public HTTPS: NOT_RUN.** Emulator loopback tests do not establish a device key boundary, public certificate validation, or network recovery.
+
+The package, manifest, image-label, encrypted Android `session.capabilities`, real Node/Codex approval flow, and later disposable Group Endpoint grant passed. Each result has its own APK identity and evidence record. Physical Android and public HTTPS remain **NOT_RUN**.
+
+### Resolved request: disposable authorized Endpoint candidate for Group grant validation
+
+The core repository supplied `client-group-key-fixture.sh` and `client-group-key-disposable-fixture.md`. The Client used those fixed-image, disposable setup materials, then completed a real native Join and separate key-candidate publication. Android used only encrypted Hub RPCs; the Node retained its bearer and the external signer retained the Owner private key. The positive path passed on the final APK. The fixture's long Node state path exceeded the Unix socket limit; the [core handoff](cicada-core-handoff.md#core-fixture-feedback) requests a shorter real path for future runs.
+
+The completed validation sequence was:
+
+1. Start only the fixed image from this report with new disposable Hub and Node state; establish an independently trusted Client session and owner Grant.
+2. Create a leased Endpoint owned by that session's owner and joined to a Group, then use encrypted `group.key_manifest` to return the complete `candidate_attestation`, public identity, proof digest, binding digest, membership/group/join revisions, and manifest digest.
+3. Run the candidate through the final Android verifier. Sign the owner proof with the owner's external signer, import only the signed proof, and require explicit confirmation before encrypted `group.key_grant`.
+4. Query `group.key_status`; for unchanged current state expect `current_status=CURRENT`. Also demonstrate that tampered proof and wrong owner/Endpoint are rejected; after acceptance, changed membership or binding should report `STALE`, and an expired proof should report `PROOF_EXPIRED`. Preserve only redacted identifiers, state, commands, exits, and digests.
+
+This request is resolved for the one-Owner positive path. A second independently enrolled Owner is still required to prove cross-owner authorization rejection. The one-Owner fixture provided local wrong-key rejection and encrypted nonexistent Group/Endpoint business rejection; these are not counted as a two-Owner test.
+
+## Safety constraints for future Hub work
+
+- Keep all Client-Control requests on `/v2/client/rpc` and recovery on `/v2/client/rpc/recover`, using independent Hub pinning, OwnerDeviceGrant, and encrypted `session.capabilities`. Do not restore a legacy `/v1` bearer route as a fallback.
+- Keep recovery fixtures restricted to disposable state. Android must not inspect or edit the Hub database; do not add a production RPC fault switch.
+- A Group Endpoint key signature requires independent verification of the complete candidate proof and all binding/revision/digest fields. An Endpoint self-signature is not user approval.
+- `external_thread_links=false` means invitation and key-consent records remain proposals; they do not authorize message delivery. Ordinary peer content is not claimed to be Hub-blind.
+- Any new Hub release must be pinned by a clean commit, `source_dirty=false` manifest, protocol archive SHA-256, catalog SHA-256, and full image ID. A tag or earlier validation report is insufficient.
